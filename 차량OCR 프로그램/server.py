@@ -1,4 +1,3 @@
-```python
 import streamlit as st
 import zipfile
 import os
@@ -152,5 +151,3 @@ def detect(car_m, lp_m, reader, path):
 
 if __name__ == '__main__':
     main()
-
-```
