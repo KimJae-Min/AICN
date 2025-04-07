@@ -11,6 +11,7 @@ from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as ExcelImage
 from openpyxl.utils import get_column_letter
+import uuid
 
 st.set_page_config(layout='wide')
 
@@ -50,14 +51,12 @@ def save_to_excel(file_info, file_name):
     ws = wb.active
     ws.title = "차량 인식 결과"
 
-    # 열 너비 설정 (A: 파일명, B: 시간, C: 이미지 경로, D: 이미지, E: 차량 번호)
     ws.column_dimensions['A'].width = 20
     ws.column_dimensions['B'].width = 25
     ws.column_dimensions['C'].width = 60
-    ws.column_dimensions['D'].width = 25  # D열 너비는 고정 (이미지 셀)
+    ws.column_dimensions['D'].width = 25
     ws.column_dimensions['E'].width = 25
 
-    # 헤더
     ws.append(["파일명", "파일 시간", "이미지 경로", "이미지 미리보기", "차량 번호"])
 
     for row_idx, info in enumerate(file_info, start=2):
@@ -67,26 +66,15 @@ def save_to_excel(file_info, file_name):
 
         try:
             img = ExcelImage(info['이미지 경로'])
-
-            # 이미지 원본 크기 가져오기
             with Image.open(info['이미지 경로']) as pil_img:
                 width, height = pil_img.size
-
-            # 엑셀 기준 폭 고정하고, 비율 유지하면서 높이 조정
             target_width = 150
             scale_factor = target_width / width
             target_height = int(height * scale_factor)
-
             img.width = target_width
             img.height = target_height
-
-            cell_anchor = f"D{row_idx}"
-            ws.add_image(img, cell_anchor)
-
-            # 엑셀 행 높이 설정 (엑셀은 행 높이를 포인트 단위로 설정. 약 1포인트 = 1.33픽셀)
-            excel_row_height = target_height * 0.75  # 픽셀 -> 포인트 대략 보정
-            ws.row_dimensions[row_idx].height = excel_row_height
-
+            ws.add_image(img, f"D{row_idx}")
+            ws.row_dimensions[row_idx].height = target_height * 0.75
         except Exception as e:
             print(f"이미지 삽입 오류 ({info['이미지 경로']}):", e)
 
@@ -127,8 +115,7 @@ def main():
     car_m, lp_m, reader = load_model()
 
     st.title("\U0001F697 차량 번호판 자동 인식 시스템")
-
-    menu = ['About', '파일 업로드', '공란']
+    menu = ['About', '파일 업로드', '결과 확인 및 수정']
     choice = st.sidebar.selectbox('메뉴', menu)
 
     if choice == 'About':
@@ -142,12 +129,12 @@ def main():
         st.markdown("""
         - 왼쪽 사이드바에서 **'파일 업로드'** 메뉴를 선택하세요.  
         - 이미지 또는 폴더를 **ZIP 파일** 형태로 압축하여 **드래그 앤 드롭** 방식으로 업로드합니다.  
-        - 인식 결과를 엑셀로 저장할 수 있습니다.
+        - 인식 결과는 **'결과 확인 및 수정'** 탭에서 확인 및 엑셀 저장할 수 있습니다.  
+        - 결과 확인 및 수정을 원할 시, 왼쪽 메뉴의 **'결과 확인 및 수정'** 탭으로 이동하세요.
         """)
 
     elif choice == '파일 업로드':
-        st.markdown("### \U0001F4C2 이미지 / ZIP 파일 업로드 및 번호판 인식")
-
+        st.markdown("### \U0001F4C2 이미지 / ZIP 파일 업로드")
         uploaded_files = st.file_uploader(
             "파일을 이 영역에 드래그 앤 드롭 하세요. (PNG, JPG, JPEG, ZIP 지원, 최대 200MB)",
             type=['png', 'jpg', 'jpeg', 'zip'],
@@ -165,7 +152,6 @@ def main():
                 if file_ext == 'zip':
                     zip_path = save_uploaded_file('uploads', uploaded_file)
                     extracted_folder = extract_zip(zip_path)
-
                     for root, _, files in os.walk(extracted_folder):
                         for file_name in files:
                             if file_name.lower().endswith(('png', 'jpg', 'jpeg')):
@@ -192,23 +178,49 @@ def main():
                     })
                     image_dict.setdefault(license_plate, []).append(result_path)
 
+            st.success("✅ 업로드 되었습니다. 결과는 '결과 확인 및 수정' 탭에서 확인하세요.")
+            st.session_state['file_info'] = file_info
+            st.session_state['image_dict'] = image_dict
+
+    elif choice == '결과 확인 및 수정':
+        st.subheader('📁 인식 결과 보기 및 엑셀 저장')
+
+        if 'file_info' not in st.session_state or not st.session_state['file_info']:
+            st.info("📂 아직 업로드된 파일이 없습니다. '파일 업로드' 탭에서 먼저 업로드해 주세요.")
+        else:
+            file_info = st.session_state['file_info']
+            image_dict = st.session_state['image_dict']
+
+            image_dict = {k: v for k, v in image_dict.items() if v}  # 빈 리스트 제거
             sorted_plates = sorted(image_dict.keys())
+
             col1, col2 = st.columns([1, 2])
             with col1:
                 selected_plate = st.radio("차량 번호를 선택하세요:", sorted_plates)
+
             with col2:
                 if selected_plate and selected_plate in image_dict:
                     for idx, img_path in enumerate(image_dict[selected_plate]):
                         st.image(img_path, caption=f"{selected_plate} - 이미지 {idx+1}", use_container_width=True)
-                        if "검출된 차 없음" in selected_plate:
-                            st.warning("⚠️ 이 이미지에서는 차량이 검출되지 않았습니다.")
+                        file_name = os.path.basename(img_path).replace("\\", "_").replace("/", "_")
+                        new_plate = st.text_input(f"수정할 차량 번호 (이미지 {idx+1})", key=f"input_{file_name}_{idx}")
+                        if st.button(f"수정", key=f"btn_{file_name}_{idx}"):
+                            if new_plate:
+                                image_dict[selected_plate].remove(img_path)
+                                if not image_dict[selected_plate]:
+                                    del image_dict[selected_plate]
+                                image_dict.setdefault(new_plate, []).append(img_path)
+                                for info in file_info:
+                                    if info['이미지 경로'] == img_path:
+                                        info['차량 번호'] = new_plate
+                                st.session_state['file_info'] = file_info
+                                st.session_state['image_dict'] = image_dict
+                                st.query_params['rerun'] = str(uuid.uuid4())
 
-            file_name = st.text_input("저장할 엑셀 파일명을 입력하세요 (확장자 제외)", "uploaded_images_info")
-            if st.button("Save"):
+            st.markdown("---")
+            file_name = st.text_input("📥 저장할 엑셀 파일명을 입력하세요 (확장자 제외)", "uploaded_images_info")
+            if st.button("📄 엑셀로 저장"):
                 save_to_excel(file_info, file_name)
-
-    else:
-        st.subheader('공란')
 
 if __name__ == '__main__':
     main()
