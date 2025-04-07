@@ -12,6 +12,7 @@ from openpyxl import Workbook
 from openpyxl.drawing.image import Image as ExcelImage
 from openpyxl.utils import get_column_letter
 import uuid
+import hashlib
 
 st.set_page_config(layout='wide')
 
@@ -111,8 +112,14 @@ def detect(car_m, lp_m, reader, path):
 
     return path, result_text
 
+def get_file_hash(file_bytes):
+    return hashlib.md5(file_bytes).hexdigest()
+
 def main():
     car_m, lp_m, reader = load_model()
+
+    if 'uploaded_hashes' not in st.session_state:
+        st.session_state['uploaded_hashes'] = set()
 
     st.title("\U0001F697 차량 번호판 자동 인식 시스템")
     menu = ['About', '파일 업로드', '결과 확인 및 수정']
@@ -145,7 +152,6 @@ def main():
 
         if uploaded_files:
             for uploaded_file in uploaded_files:
-                current_time = datetime.now().isoformat().replace(':', "_")
                 file_ext = uploaded_file.name.split('.')[-1].lower()
 
                 if file_ext == 'zip':
@@ -155,8 +161,21 @@ def main():
                         for file_name in files:
                             if file_name.lower().endswith(('png', 'jpg', 'jpeg')):
                                 file_path = os.path.join(root, file_name)
+                                try:
+                                    with open(file_path, 'rb') as f:
+                                        file_bytes = f.read()
+                                    file_hash = get_file_hash(file_bytes)
+                                except Exception:
+                                    continue
+
+                                if file_hash in st.session_state['uploaded_hashes']:
+                                    st.toast(f"⚠️ 중복 이미지 무시됨: {file_name}", icon="⚠️")
+                                    continue
+
+                                st.session_state['uploaded_hashes'].add(file_hash)
                                 result_path, texts = detect(car_m, lp_m, reader, file_path)
                                 license_plate = ", ".join(texts)
+                                current_time = datetime.now().isoformat().replace(':', "_")
                                 file_info.append({
                                     '파일명': file_name,
                                     '파일 시간': current_time,
@@ -166,9 +185,18 @@ def main():
                                 image_dict.setdefault(license_plate, []).append(result_path)
 
                 elif file_ext in ['png', 'jpg', 'jpeg']:
+                    file_bytes = uploaded_file.getvalue()
+                    file_hash = get_file_hash(file_bytes)
+
+                    if file_hash in st.session_state['uploaded_hashes']:
+                        st.toast(f"⚠️ 중복 이미지 무시됨: {uploaded_file.name}", icon="⚠️")
+                        continue
+
+                    st.session_state['uploaded_hashes'].add(file_hash)
                     file_path = save_uploaded_file('uploads', uploaded_file)
                     result_path, texts = detect(car_m, lp_m, reader, file_path)
                     license_plate = ", ".join(texts)
+                    current_time = datetime.now().isoformat().replace(':', "_")
                     file_info.append({
                         '파일명': uploaded_file.name,
                         '파일 시간': current_time,
@@ -178,8 +206,10 @@ def main():
                     image_dict.setdefault(license_plate, []).append(result_path)
 
             st.success("✅ 업로드 되었습니다. 결과는 '결과 확인 및 수정' 탭에서 확인하세요.")
-            st.session_state['file_info'] = file_info
-            st.session_state['image_dict'] = image_dict
+            st.session_state['file_info'] = st.session_state.get('file_info', []) + file_info
+            for k, v in image_dict.items():
+                st.session_state['image_dict'] = st.session_state.get('image_dict', {})
+                st.session_state['image_dict'].setdefault(k, []).extend(v)
 
     elif choice == '결과 확인 및 수정':
         st.subheader('📁 인식 결과 보기 및 수정, 엑셀 저장')
@@ -202,7 +232,7 @@ def main():
                         file_name = os.path.basename(img_path).replace("\\", "_").replace("/", "_")
                         current_info = next((info for info in file_info if info['이미지 경로'] == img_path), None)
 
-                        cols = st.columns([2, 1, 1, 1])  # 이미지, 기존 번호, 수정 입력, 수정 버튼
+                        cols = st.columns([2, 1, 1, 1])
                         with cols[0]:
                             st.image(img_path, caption=f"이미지 {idx+1}", use_container_width=True)
                         with cols[1]:
