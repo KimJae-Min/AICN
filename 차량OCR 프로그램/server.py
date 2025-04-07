@@ -182,39 +182,47 @@ def main():
             st.session_state['image_dict'] = image_dict
 
     elif choice == '결과 확인 및 수정':
-        st.subheader('📁 인식 결과 보기 및 엑셀 저장')
+        st.subheader('📁 인식 결과 보기 및 수정, 엑셀 저장')
 
         if 'file_info' not in st.session_state or not st.session_state['file_info']:
             st.info("📂 아직 업로드된 파일이 없습니다. '파일 업로드' 탭에서 먼저 업로드해 주세요.")
         else:
             file_info = st.session_state['file_info']
             image_dict = st.session_state['image_dict']
-
-            image_dict = {k: v for k, v in image_dict.items() if v}  # 빈 리스트 제거
+            image_dict = {k: v for k, v in image_dict.items() if v}
             sorted_plates = sorted(image_dict.keys())
 
-            col1, col2 = st.columns([1, 2])
+            col1, col2 = st.columns([1, 4])
             with col1:
-                selected_plate = st.radio("차량 번호를 선택하세요:", sorted_plates)
+                selected_plate = st.radio("차량 번호 선택:", sorted_plates)
 
             with col2:
                 if selected_plate and selected_plate in image_dict:
                     for idx, img_path in enumerate(image_dict[selected_plate]):
-                        st.image(img_path, caption=f"{selected_plate} - 이미지 {idx+1}", use_container_width=True)
                         file_name = os.path.basename(img_path).replace("\\", "_").replace("/", "_")
-                        new_plate = st.text_input(f"수정할 차량 번호 (이미지 {idx+1})", key=f"input_{file_name}_{idx}")
-                        if st.button(f"수정", key=f"btn_{file_name}_{idx}"):
-                            if new_plate:
-                                image_dict[selected_plate].remove(img_path)
-                                if not image_dict[selected_plate]:
-                                    del image_dict[selected_plate]
-                                image_dict.setdefault(new_plate, []).append(img_path)
-                                for info in file_info:
-                                    if info['이미지 경로'] == img_path:
-                                        info['차량 번호'] = new_plate
-                                st.session_state['file_info'] = file_info
-                                st.session_state['image_dict'] = image_dict
-                                st.query_params['rerun'] = str(uuid.uuid4())
+                        current_info = next((info for info in file_info if info['이미지 경로'] == img_path), None)
+
+                        cols = st.columns([2, 1, 1, 1])  # 이미지, 기존 번호, 수정 입력, 수정 버튼
+                        with cols[0]:
+                            st.image(img_path, caption=f"이미지 {idx+1}", use_container_width=True)
+                        with cols[1]:
+                            st.markdown("**기존 번호**")
+                            st.write(current_info['차량 번호'] if current_info else "N/A")
+                        with cols[2]:
+                            new_plate = st.text_input("수정할 번호", key=f"input_{file_name}_{idx}")
+                        with cols[3]:
+                            if st.button("수정", key=f"btn_{file_name}_{idx}"):
+                                if new_plate:
+                                    image_dict[selected_plate].remove(img_path)
+                                    if not image_dict[selected_plate]:
+                                        del image_dict[selected_plate]
+                                    image_dict.setdefault(new_plate, []).append(img_path)
+                                    for info in file_info:
+                                        if info['이미지 경로'] == img_path:
+                                            info['차량 번호'] = new_plate
+                                    st.session_state['file_info'] = file_info
+                                    st.session_state['image_dict'] = image_dict
+                                    st.rerun()
 
             st.markdown("---")
             file_name = st.text_input("📥 저장할 엑셀 파일명을 입력하세요 (확장자 제외)", "uploaded_images_info")
