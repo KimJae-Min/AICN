@@ -78,8 +78,8 @@
 2. `labels/filtered_label/` 에서 JSON 파일 불러오기
 3. 각 차량에 대해:
    - JSON에서 차량 bbox, 번호판 bbox 읽기
-4. 차량 이미지 열기
-5. 번호판 이미지 붙여기 (랜덤 선택 + 리사이즈)
+4. 차량 이미지 불러오기
+5. 불러온 이미지에 번호판 이미지 붙이기 (랜덤 선택 + 리사이즈)
 6. 결과 이미지 저장
 
 
@@ -103,13 +103,13 @@
   ]
   ```
 
-- 차량 bbox + 번호판 bbox 출력
+- 차량 bbox + 번호판 bbox 추출
   ```python
   car_pts = data['car']['bbox']
   plate_pts = data['plate']['bbox']
   ```
   - (x1, y1), (x2, y2) 형식으로 정리
-  - 조합 순서 정렬 (x1<x2, y1<y2)
+  - 좌표의 순서 정렬
 
 - 번호판 bbox를 차량 기준 상대좌표로 변환
   ```python
@@ -125,6 +125,9 @@
   plate_resized = cv2.resize(plate_img, (pw, ph))
   img[new_y1:new_y2, new_x1:new_x2] = plate_resized
   ```
+  - 번호판 이미지 중 하나를 랜덤으로 선택
+  - 번호판 bbox 크기에 맞게 리사이즈
+  - 차량 이미지에 부착
 
 ---
 
