@@ -32,13 +32,13 @@
 ## 🚀 실행 방법
 
 ### ▶️ create_plate.py
+(출처: https://github.com/Oh-JongJin/Virtual_Number_Plate)
 **흐름 요약**
 
 1. 번호판 종류 결정
 2. 랜덤 글자 조합 (숫자 + 한글 + 숫자)
 3. 배경 이미지 열기
 4. 글자 위치에 텍스트 그린 후 저장
-(출처: https://github.com/Oh-JongJin/Virtual_Number_Plate)
 
 
 
