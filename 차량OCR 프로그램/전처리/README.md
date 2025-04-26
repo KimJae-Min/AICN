@@ -15,5 +15,5 @@
   - ```generate_img.py```: 생성한 이미지를 차량 이미지에 부착한 결과 사진을 저장
   - ```create_plate.py```: 랜덤 번호판 생성
   - 사용한 fonts
-      - Hangil.ttf
-      - NotoSansKR-Medium.ttf
+      - ```Hangil.ttf```
+      - ```NotoSansKR-Medium.ttf```
