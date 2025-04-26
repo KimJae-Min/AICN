@@ -24,8 +24,8 @@
 - `create_plate.py`  
   → 랜덤으로 번호판 이미지를 생성하는 코드
 - 사용된 fonts
-  - `Hangil.ttf`: 한글용 포트
-  - `NotoSansKR-Medium.ttf`: 숫자용 포트
+  - `Hangil.ttf`: 한글용 폰트
+  - `NotoSansKR-Medium.ttf`: 숫자용 폰폰트
 
 ---
 
@@ -119,7 +119,7 @@
   new_y2 = plate_y2 - cy1
   ```
 
-- 번호판 이미지 붙여기
+- 번호판 이미지 부착
   ```python
   plate_img = random.choice(plate_files)
   plate_resized = cv2.resize(plate_img, (pw, ph))
