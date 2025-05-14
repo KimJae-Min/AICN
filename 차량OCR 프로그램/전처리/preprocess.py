@@ -1,43 +1,59 @@
 #!/usr/bin/env python3
-import json, random, csv
+import json
+import random
+import csv
+import re
+import unicodedata
+import shutil
 from pathlib import Path
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from tqdm import tqdm
 
 # ───── 설정 ─────────────────────────────────────────────────
 PROJECT_ROOT       = Path(__file__).resolve().parent.parent
-RAW_FULL_ANN_DIR   = PROJECT_ROOT/"raw/full_vehicle/annotations"
-RAW_FULL_IMG_ROOT  = PROJECT_ROOT/"raw/full_vehicle/images"
-RAW_CROP_DIR       = PROJECT_ROOT/"raw/cropped_plate"
-OUT_DET            = PROJECT_ROOT/"datasets/detection"
-OUT_REC            = PROJECT_ROOT/"datasets/recognition"
-DATA_DIR           = PROJECT_ROOT/"data"
+RAW_FULL_ANN_DIR   = PROJECT_ROOT / "raw/full_vehicle/annotations"
+RAW_FULL_IMG_ROOT  = PROJECT_ROOT / "raw/full_vehicle/images"
+RAW_CROP_DIR       = PROJECT_ROOT / "raw/cropped_plate"
+OUT_DET            = PROJECT_ROOT / "datasets/detection"
+OUT_REC            = PROJECT_ROOT / "datasets/recognition"
+DATA_DIR           = PROJECT_ROOT / "data"
 VAL_RATIO          = 0.2
 CLASS_ID           = 0
 CLASS_NAMES        = ["license_plate"]
 
 # ───── 1) 이미지 인덱스 구축 ─────────────────────────────────────
 print("⏳ Indexing images under", RAW_FULL_IMG_ROOT)
-IMG_IDX = {p.name: p for p in RAW_FULL_IMG_ROOT.rglob("*") if p.is_file()}
+
+def norm(s: str) -> str:
+    return unicodedata.normalize("NFC", s)
+
+IMG_IDX = {
+    norm(p.name): p
+    for p in RAW_FULL_IMG_ROOT.rglob("*")
+    if p.is_file()
+}
 print(f"📂 Found {len(IMG_IDX)} images")
 
 def find_img(filename: str) -> Path:
-    """
-    1) 정확히 매칭
-    2) 접미사 매칭 (endswith)
-    3) 부분 문자열 매칭
-    """
+    fn = norm(filename)
     # 1) exact
-    if filename in IMG_IDX:
-        return IMG_IDX[filename]
+    if fn in IMG_IDX:
+        return IMG_IDX[fn]
     # 2) suffix
     for name, path in IMG_IDX.items():
-        if name.endswith(filename):
+        if name.endswith(fn):
             return path
     # 3) substring
     for name, path in IMG_IDX.items():
-        if filename in name:
+        if fn in name:
             return path
+    # 4) 접두사 제거
+    m = re.match(r'^\d+_\d+_(.+)$', fn)
+    if m:
+        rest = m.group(1)
+        for name, path in IMG_IDX.items():
+            if name.endswith(rest):
+                return path
     raise FileNotFoundError(f"{filename} not found")
 
 # ───── 2) 전체 어노테이션 로드 & 셔플 ────────────────────────────
@@ -46,7 +62,7 @@ print("⏳ Loading annotation entries…")
 for jf in tqdm(list(RAW_FULL_ANN_DIR.rglob("*.json")), desc="JSON files"):
     try:
         data = json.loads(jf.read_text(encoding="utf-8"))
-    except:
+    except Exception:
         continue
     if isinstance(data, list):
         all_ann.extend(data)
@@ -62,42 +78,56 @@ train_entries, val_entries = all_ann[n_val:], all_ann[:n_val]
 print(f"▶ Train/Val split: {len(train_entries):,}/{len(val_entries):,}")
 
 # ───── 3) Detection 전처리 ───────────────────────────────────
+# images/ 와 labels/ 폴더 구조 미리 생성
+(OUT_DET / "images" / "train").mkdir(parents=True, exist_ok=True)
+(OUT_DET / "images" / "val"  ).mkdir(parents=True, exist_ok=True)
 (OUT_DET / "labels" / "train").mkdir(parents=True, exist_ok=True)
 (OUT_DET / "labels" / "val"  ).mkdir(parents=True, exist_ok=True)
-OUT_DET.mkdir(parents=True, exist_ok=True)
 
 def yolo_line(bbox, w, h, cid=0):
-    (x1,y1),(x2,y2) = bbox
-    xc = ((x1+x2)/2)/w; yc = ((y1+y2)/2)/h
-    bw = (x2-x1)/w; bh = (y2-y1)/h
+    (x1, y1), (x2, y2) = bbox
+    xc = ((x1 + x2) / 2) / w
+    yc = ((y1 + y2) / 2) / h
+    bw = (x2 - x1) / w
+    bh = (y2 - y1) / h
     return f"{cid} {xc:.6f} {yc:.6f} {bw:.6f} {bh:.6f}"
 
 def make_detection(entries, subset):
-    seen = set()
-    list_f = open(OUT_DET/f"{subset}.txt","w")
+    seen, mismatches = set(), []
     for e in tqdm(entries, desc=f"Detect→{subset}", mininterval=1.0):
         fn = Path(e["imagePath"]).name
         if fn in seen:
             continue
         try:
-            img_p = find_img(fn)
+            src = find_img(fn)
         except FileNotFoundError:
+            if len(mismatches) < 10:
+                mismatches.append(fn)
             continue
         seen.add(fn)
 
-        bbox = e.get("plate",{}).get("bbox")
+        bbox = e.get("plate", {}).get("bbox")
         if not bbox:
             continue
 
-        w, h = Image.open(img_p).size
-        line = yolo_line(bbox, w, h, CLASS_ID)
-        # 레이블 파일 쓰기
-        lbl_file = OUT_DET/"labels"/subset/f"{img_p.stem}.txt"
-        lbl_file.write_text(line + "\n", encoding="utf-8")
-        # 리스트에 이미지 경로 추가
-        list_f.write(str(img_p.resolve()) + "\n")
+        # 이미지 크기 얻기 (깨진 파일은 무시)
+        try:
+            w, h = Image.open(src).size
+        except UnidentifiedImageError:
+            print(f"⚠️ Skipping unreadable image: {src}")
+            continue
 
-    list_f.close()
+        # 1) 심볼릭 링크 생성 (실제 복사 없이)
+        dst_img = OUT_DET/"images"/subset/src.name
+        if not dst_img.exists():
+            dst_img.symlink_to(src)
+
+        # 2) 라벨(.txt) 생성
+        line = yolo_line(bbox, w, h, CLASS_ID)
+        lbl = OUT_DET/"labels"/subset/f"{dst_img.stem}.txt"
+        lbl.write_text(line + "\n", encoding="utf-8")
+
+    print(f"▶ sample mismatches: {mismatches}")
     print(f"✅ {subset} detection done: {len(seen):,} images")
 
 make_detection(train_entries, "train")
@@ -105,37 +135,51 @@ make_detection(val_entries,   "val")
 
 # custom_det.yaml 생성
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-yaml = DATA_DIR/"custom_det.yaml"
+yaml = DATA_DIR / "custom_det.yaml"
 yaml.write_text(
-    f"train: { (OUT_DET/'train.txt').resolve() }\n"
-    f"val:   { (OUT_DET/'val.txt').resolve() }\n\n"
+    f"train: { (OUT_DET/'images'/'train').resolve() }\n"
+    f"val:   { (OUT_DET/'images'/'val').resolve() }\n\n"
     f"nc: {len(CLASS_NAMES)}\nnames: {CLASS_NAMES}\n"
 )
 print("✅ Detection config written to", yaml)
 
 # ───── 4) Recognition 전처리 ───────────────────────────────────
-plate_jsons = list(RAW_CROP_DIR.rglob("plate.json"))
-if not plate_jsons:
-    print("⚠️ No plate.json found under", RAW_CROP_DIR, "→ Skipping recognition")
-else:
-    (OUT_REC / "labels").mkdir(parents=True, exist_ok=True)
-    for pj in plate_jsons:
-        subset = pj.parent.name  # 예: 'train' 또는 'val'
-        img_root = pj.parent/"images"
-        out_csv = OUT_REC/"labels"/f"{subset}.csv"
-        rows = [["image","plate"]]
+for subset in ("train", "val"):
+    label_dir = RAW_CROP_DIR / subset / "labels"
+    img_root  = RAW_CROP_DIR / subset / "images"
+    out_img   = OUT_REC / "images" / subset
+    out_csv   = OUT_REC / "labels" / f"{subset}.csv"
 
-        annos = json.loads(pj.read_text(encoding="utf-8"))
-        for p in tqdm(annos, desc=f"Recog→{subset}", mininterval=1.0):
-            fn  = p.get("imagePath")
-            txt = p.get("value","")
-            ip  = img_root/fn
-            if ip.exists():
-                rows.append([str(ip.resolve()), txt])
+    out_img.mkdir(parents=True, exist_ok=True)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
 
-        with open(out_csv, "w", newline="", encoding="utf-8") as cf:
-            writer = csv.writer(cf)
-            writer.writerows(rows)
-        print(f"✅ {subset} recognition CSV: {len(rows)-1:,} entries")
+    rows = [["image", "plate"]]
+    for jf in label_dir.rglob("*.json"):
+        try:
+            data = json.loads(jf.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"⚠️ JSON 로드 실패: {jf} ({e})")
+            continue
+
+        img_name  = data.get("imagePath")
+        plate_txt = data.get("value", "")
+        if not img_name:
+            continue
+
+        src_crop = img_root / img_name
+        if not src_crop.exists():
+            print(f"⚠️ 크롭 이미지 누락: {src_crop} — 건너뜁니다.")
+            continue
+
+        dst_crop = out_img / img_name
+        if not dst_crop.exists():
+            dst_crop.symlink_to(src_crop)
+
+        rows.append([str(dst_crop.resolve()), plate_txt])
+
+    with open(out_csv, "w", newline="", encoding="utf-8") as cf:
+        writer = csv.writer(cf)
+        writer.writerows(rows)
+    print(f"✅ {subset} recognition CSV: {len(rows)-1:,} entries")
 
 print("🎉 Preprocessing complete.")
