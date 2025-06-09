@@ -1,3 +1,5 @@
+# 택시 번호판 증강용
+
 import os, random
 import cv2
 import numpy as np
