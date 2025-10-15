@@ -1,0 +1,5 @@
+path: C:/Users/win/Desktop/lp_yolo_fuse/data
+train: images/train
+val: images/val
+nc: 1
+names: [plate]
