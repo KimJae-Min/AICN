@@ -1,75 +1,94 @@
-﻿import torch, torch.nn as nn
+# -*- coding: utf-8 -*-
+import torch, torch.nn as nn
 import torch.nn.functional as F
 
-def bbox_iou_xyxy(boxes1, boxes2, eps=1e-9):
-    # boxes1: [N,4], boxes2: [M,4] or [4]
-    if boxes2.dim() == 1:
-        boxes2 = boxes2.unsqueeze(0)
-    x1 = torch.max(boxes1[..., 0:1], boxes2[..., 0:1])
-    y1 = torch.max(boxes1[..., 1:2], boxes2[..., 1:2])
-    x2 = torch.min(boxes1[..., 2:3], boxes2[..., 2:3])
-    y2 = torch.min(boxes1[..., 3:4], boxes2[..., 3:4])
+# ------------ 기존 것들 (그대로 유지) ------------
+def bbox_iou_xyxy(a, b, eps=1e-9):
+    # a:[N,4], b:[N,4] or [1,4] broadcast
+    x1 = torch.max(a[..., 0], b[..., 0])
+    y1 = torch.max(a[..., 1], b[..., 1])
+    x2 = torch.min(a[..., 2], b[..., 2])
+    y2 = torch.min(a[..., 3], b[..., 3])
     inter = (x2 - x1).clamp(min=0) * (y2 - y1).clamp(min=0)
-    a1 = (boxes1[..., 2] - boxes1[..., 0]).clamp(min=0) * (boxes1[..., 3] - boxes1[..., 1]).clamp(min=0)
-    a2 = (boxes2[..., 2] - boxes2[..., 0]).clamp(min=0) * (boxes2[..., 3] - boxes2[..., 1]).clamp(min=0)
-    return inter / (a1 + a2 - inter + eps)
+    aa = (a[..., 2] - a[..., 0]).clamp(min=0) * (a[..., 3] - a[..., 1]).clamp(min=0)
+    bb = (b[..., 2] - b[..., 0]).clamp(min=0) * (b[..., 3] - b[..., 1]).clamp(min=0)
+    return inter / (aa + bb - inter + eps)
 
 class BCEWithLogitsLossWeighted(nn.Module):
     def __init__(self, pos_weight=1.0):
         super().__init__()
-        # buffer로 등록해 저장/로드는 되되, forward 때 pred.device로 옮길 수 있게
-        self.register_buffer("pos_weight_buf", torch.tensor(float(pos_weight), dtype=torch.float32))
-
+        self.bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight))
     def forward(self, pred, target):
-        pw = self.pos_weight_buf.to(pred.device)
-        return F.binary_cross_entropy_with_logits(pred, target.to(pred.device), pos_weight=pw, reduction='none').mean()
+        return self.bce(pred, target)
 
+# ------------ 새로 추가: Focal BCE ------------
+class FocalBCE(nn.Module):
+    """
+    간단·안정 버전의 Focal BCE
+    - alpha: 양성/음성 비중
+    - gamma: 쉽고 확신 높은 샘플 억제(>0)
+    """
+    def __init__(self, alpha=0.25, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, logits, target):
+        # logits, target: 동일 shape
+        p = torch.sigmoid(logits)
+        ce = F.binary_cross_entropy_with_logits(logits, target, reduction='none')
+        p_t = p * target + (1 - p) * (1 - target)
+        alpha_t = self.alpha * target + (1 - self.alpha) * (1 - target)
+        loss = alpha_t * (1 - p_t).pow(self.gamma) * ce
+        return loss.mean()
+
+# ------------ 기존: DFL ------------
 class DFLLoss(nn.Module):
-    def __init__(self, bins=16):
+    """
+    간단한 Distribution Focal Loss (classification-style on distance bins)
+    reg_logits: [B, 4*bins, H, W]
+    targets:    [B, HW, 4]  (stride 정규화된 float distance)
+    pos_mask:   [B, HW]     (양성 위치)
+    """
+    def __init__(self, bins=8):
         super().__init__()
         self.bins = bins
 
-    @torch.no_grad()
-    def build_soft_targets(self, dist):  # dist: [P,4] in [0, bins-1]
-        # 선형 보간 : floor/ceil에 (1-d), d 가중치
-        lb = dist.floor().clamp(min=0, max=self.bins-1)
-        ub = (lb + 1).clamp(max=self.bins-1)
-        d  = (dist - lb).clamp(0,1)
-        lb = lb.long(); ub = ub.long()
-
-        # one-hot 2개를 합치는 방식으로 [P,4,bins] 분포 생성
-        P = dist.shape[0]
-        tgt = torch.zeros(P, 4, self.bins, device=dist.device, dtype=torch.float32)
-        tgt.scatter_(2, lb.unsqueeze(-1), (1.0 - d).unsqueeze(-1))
-        # ub==lb인 경우도 있으니 add_ 사용
-        tgt.scatter_add_(2, ub.unsqueeze(-1), d.unsqueeze(-1))
-        return tgt  # [P,4,bins]
-
-    def forward(self, reg_logits, dist_targets, pos_mask):
-        """
-        reg_logits: [B, 4*bins, H, W]
-        dist_targets: [B, HW, 4]  (stride로 나눈 거리값)
-        pos_mask: [B, HW] bool
-        """
-        B, _, H, W = reg_logits.shape
+    def forward(self, reg_logits, targets, pos_mask):
+        B, C, H, W = reg_logits.shape
         bins = self.bins
-        HW = H * W
+        assert C == 4 * bins, "reg channel must be 4*bins"
 
-        # [B,HW,4*bins] -> [B,HW,4,bins]
-        logits = reg_logits.permute(0,2,3,1).reshape(B, HW, 4, bins)
-        # pos만 사용
-        pm = pos_mask.view(B, HW)
+        # [B,HW,4*bins]
+        reg_logits = reg_logits.permute(0,2,3,1).reshape(B, -1, 4*bins)
+        # [B,HW,4]
+        t = targets
+        pm = pos_mask  # [B,HW], bool
+
         if pm.sum() == 0:
-            return logits.sum() * 0.0
+            return reg_logits.sum() * 0.0
 
-        logits_pos = logits[pm]                 # [P,4,bins]
-        dist_pos   = dist_targets[pm]           # [P,4]
+        # 정수/소수 분해
+        t_clamped = t.clamp(min=0, max=bins-1-1e-4)
+        l_id = t_clamped.floor().long()                  # [B,HW,4]
+        u_id = (l_id + 1).clamp(max=bins-1)
+        w_u = t_clamped - l_id.float()                   # [B,HW,4]
+        w_l = 1.0 - w_u
 
-        # [0, bins-1]로 클램프
-        dist_pos = dist_pos.clamp(0, bins-1)
-        tgt = self.build_soft_targets(dist_pos) # [P,4,bins]
+        # gather logits → CE
+        reg_logits = reg_logits[pm]                      # [P,4*bins]
+        l_id = l_id[pm]                                  # [P,4]
+        u_id = u_id[pm]
+        w_l = w_l[pm]
+        w_u = w_u[pm]
 
-        # Cross-Entropy with soft targets = -sum(tgt * log_softmax)
-        logp = F.log_softmax(logits_pos, dim=-1)
-        loss = -(tgt * logp).sum(dim=-1).mean() # 평균
-        return loss
+        # 각 좌표별로 softmax+CE
+        loss = 0.0
+        for i in range(4):
+            # [P, bins]
+            li = reg_logits[:, i*bins:(i+1)*bins]
+            logp = torch.log_softmax(li, dim=1)         # [P,bins]
+            loss_l = F.nll_loss(logp, l_id[:, i], reduction='none')
+            loss_u = F.nll_loss(logp, u_id[:, i], reduction='none')
+            loss += (w_l[:, i] * loss_l + w_u[:, i] * loss_u).mean()
+        return loss / 4.0
