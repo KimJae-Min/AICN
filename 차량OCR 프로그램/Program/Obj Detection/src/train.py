@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 import os, glob, random, time, csv, argparse
 from pathlib import Path
 from typing import List, Tuple
@@ -11,8 +11,9 @@ from PIL import Image
 from tqdm import tqdm
 
 from .model import LP_YOLO_Fuse
-from .losses import bbox_iou_xyxy, BCEWithLogitsLossWeighted, DFLLoss
+from .losses import bbox_iou_xyxy, BCEWithLogitsLossWeighted, DFLLoss, FocalBCE
 from .utils_common import dist2bbox_ltbr  # dist2bbox_ltbr(reg:[B,HW,4], cx:[HW], cy:[HW]) → [B,HW,4]
+
 
 # =========================
 # CLI / Config
@@ -25,15 +26,21 @@ def parse_args():
     ap.add_argument("--imgsz", type=int, default=512)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--weight_decay", type=float, default=1e-4)
+
     ap.add_argument("--use_psa", type=int, default=1)       # 1:on, 0:off
     ap.add_argument("--use_dfl", type=int, default=0)       # 1:on, 0:off
     ap.add_argument("--bins", type=int, default=8)
+
+    # 추가: 양성 확장폭 / 포컬로스 선택
+    ap.add_argument("--pos_expand", type=float, default=0.25, help="양성 포인트 확장폭 (stride * pos_expand)")
+    ap.add_argument("--loss_focal", type=int, default=0, help="obj/cls에 Focal BCE 사용(1) or BCE(0)")
+    ap.add_argument("--focal_alpha", type=float, default=0.25)
+    ap.add_argument("--focal_gamma", type=float, default=2.0)
+
     ap.add_argument("--run", default="default")
     ap.add_argument("--seed", type=int, default=2025)
-    # 새 옵션 2개: DFL 손실 가중치, 양성 확장폭( stride * pos_expand )
-    ap.add_argument("--dfl_weight", type=float, default=0.5)
-    ap.add_argument("--pos_expand", type=float, default=0.5)
     return ap.parse_args()
+
 
 # =========================
 # Utils
@@ -44,15 +51,18 @@ def set_seed(seed=2025):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+
 def read_yolo_txt(txt_path: Path) -> torch.Tensor:
-    """YOLO txt → [N,4] (정규 xyxy)"""
+    """
+    YOLO txt → [N,4] (정규 xyxy)
+    """
     if not txt_path.exists():
         return torch.zeros(0, 4, dtype=torch.float32)
     lines = [l.strip() for l in txt_path.read_text(encoding="utf-8", errors="ignore").splitlines() if l.strip()]
     boxes = []
     for l in lines:
         parts = l.split()
-        if len(parts) != 5:
+        if len(parts) != 5:  # class cx cy w h
             continue
         _, cx, cy, w, h = map(float, parts)
         x1 = cx - w / 2; y1 = cy - h / 2
@@ -62,8 +72,12 @@ def read_yolo_txt(txt_path: Path) -> torch.Tensor:
         return torch.zeros(0, 4, dtype=torch.float32)
     return torch.tensor(boxes, dtype=torch.float32)
 
+
 def load_image_and_scale_boxes(img_path: Path, boxes_xyxy_norm: torch.Tensor, out_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """이미지 [3,H,W](0~1) 로드 + 리사이즈, 라벨은 정규→px→리사이즈 px"""
+    """
+    이미지를 [3,H,W] (0~1)로 로드 + 단순 리사이즈(out_size)
+    라벨은 정규좌표→px→리사이즈 px로 변환
+    """
     im = Image.open(img_path).convert("RGB")
     W, H = im.size
     im = im.resize((out_size, out_size), Image.BILINEAR)
@@ -82,6 +96,7 @@ def load_image_and_scale_boxes(img_path: Path, boxes_xyxy_norm: torch.Tensor, ou
         xyxy = torch.zeros(0, 4, dtype=torch.float32)
     return img, xyxy
 
+
 # =========================
 # Dataset / Dataloader
 # =========================
@@ -90,7 +105,9 @@ class YOLOTxtPlateDataset(Dataset):
         self.imgs = sorted([p for p in img_dir.glob("*") if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]])
         self.lbl_dir = lbl_dir
         self.img_size = img_size
+
     def __len__(self): return len(self.imgs)
+
     def __getitem__(self, idx):
         ip = self.imgs[idx]
         lp = self.lbl_dir / f"{ip.stem}.txt"
@@ -99,10 +116,12 @@ class YOLOTxtPlateDataset(Dataset):
         labels = torch.zeros((boxes.shape[0],), dtype=torch.long)  # 단일 클래스
         return img, boxes, labels
 
+
 def collate_fn(batch):
     imgs, boxes_list, labels_list = zip(*batch)
     imgs = torch.stack(imgs, dim=0)
     return imgs, list(boxes_list), list(labels_list)
+
 
 # =========================
 # Grid & target
@@ -113,10 +132,10 @@ def build_grid(H, W, stride, device):
     cy, cx = torch.meshgrid(ys, xs, indexing='ij')
     return cx * stride, cy * stride  # pixel center
 
-def make_targets(boxes_list: List[torch.Tensor], cx: torch.Tensor, cy: torch.Tensor,
-                 B: int, stride: int, pos_expand: float):
+
+def make_targets(boxes_list: List[torch.Tensor], cx: torch.Tensor, cy: torch.Tensor, B: int, stride: int, pos_expand: float):
     """
-    박스 내부 + 주변(stride*pos_expand) 양성, 각 GT 최근접 포인트 1개 강제 양성
+    박스 내부 + 주변(stride*pos_expand)을 양성, 각 GT 최근접 포인트 1개 강제 양성
     """
     H, W = cy.shape[0], cx.shape[1]
     obj_tgt = torch.zeros((B, 1, H, W), device=cx.device, dtype=torch.float32)
@@ -129,6 +148,7 @@ def make_targets(boxes_list: List[torch.Tensor], cx: torch.Tensor, cy: torch.Ten
         boxes = boxes_list[b].to(cx.device)  # [N,4]
         if boxes.numel() == 0:
             continue
+
         x1 = (boxes[:, 0:1] - expand)
         y1 = (boxes[:, 1:2] - expand)
         x2 = (boxes[:, 2:3] + expand)
@@ -137,12 +157,12 @@ def make_targets(boxes_list: List[torch.Tensor], cx: torch.Tensor, cy: torch.Ten
         inside = (cxv[None, :] >= x1) & (cxv[None, :] <= x2) & (cyv[None, :] >= y1) & (cyv[None, :] <= y2)  # [N,HW]
         inside_any = inside.any(dim=0)  # [HW]
 
-        # 각 GT center에 가장 가까운 포인트 1개 강제 양성
+        # 각 GT의 center에 가장 가까운 포인트 1개 강제 양성
         gxc = (boxes[:, 0] + boxes[:, 2]) / 2
         gyc = (boxes[:, 1] + boxes[:, 3]) / 2
-        d2 = (cxv[None, :] - gxc[:, None]) ** 2 + (cyv[None, :] - gyc[:, None]) ** 2  # [N,HW]
+        d2 = (cxv[None, :] - gxc[:, None]).pow(2) + (cyv[None, :] - gyc[:, None]).pow(2)  # [N,HW]
         idx = d2.argmin(dim=1)  # [N]
-        force = torch.zeros_like(inside_any)
+        force = torch.zeros_like(inside_any, dtype=torch.bool)
         force[idx] = True
 
         pos = inside_any | force
@@ -151,35 +171,47 @@ def make_targets(boxes_list: List[torch.Tensor], cx: torch.Tensor, cy: torch.Ten
 
     return obj_tgt, pos_mask_flat
 
+
 # =========================
 # DFL projection (추론/IoU 계산용)
 # =========================
 def dfl_project(reg_logits: torch.Tensor, bins: int):
-    """reg_logits: [B, HW, 4*bins] → [B, HW, 4]"""
+    """
+    reg_logits: [B, HW, 4*bins] → [B, HW, 4]
+    """
     B = reg_logits.shape[0]
-    x = reg_logits.view(B, -1, 4, bins)             # [B,HW,4,bins]
+    x = reg_logits.view(B, -1, 4, bins)               # [B,HW,4,bins]
     prob = torch.softmax(x, dim=-1)
     idx = torch.arange(bins, device=reg_logits.device, dtype=torch.float32)
-    dist = (prob * idx).sum(dim=-1)                  # [B,HW,4]
+    dist = (prob * idx).sum(dim=-1)                    # [B,HW,4]
     return dist
+
 
 # =========================
 # Train loop
 # =========================
-def train_one_epoch(model, loader, device, lr, weight_decay, img_size,
-                    epoch_idx, epochs, use_dfl: bool, bins: int,
-                    dfl_weight: float, pos_expand: float, csv_writer=None):
+def train_one_epoch(model, loader, device, lr, weight_decay, img_size, epoch_idx, epochs,
+                    use_dfl: bool, bins: int, use_focal: bool, focal_alpha: float, focal_gamma: float,
+                    pos_expand: float, csv_writer=None):
+
     model.train()
     opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    bce = BCEWithLogitsLossWeighted(pos_weight=1.5)
+
+    if use_focal:
+        crit = FocalBCE(alpha=focal_alpha, gamma=focal_gamma)
+        obj_crit = crit
+        cls_crit = crit
+    else:
+        obj_crit = BCEWithLogitsLossWeighted(pos_weight=1.5)
+        cls_crit = BCEWithLogitsLossWeighted(pos_weight=1.0)
+
     dfl_crit = DFLLoss(bins=bins) if use_dfl else None
 
     total = len(loader)
     ema = 0.9
     sm_loss = None
 
-    pbar = tqdm(enumerate(loader), total=total, ncols=120,
-                desc=f"Epoch {epoch_idx}/{epochs}", leave=True)
+    pbar = tqdm(enumerate(loader), total=total, ncols=120, desc=f"Epoch {epoch_idx}/{epochs}", leave=True)
 
     for it, (imgs, boxes_list, _) in pbar:
         imgs = imgs.to(device)
@@ -194,56 +226,53 @@ def train_one_epoch(model, loader, device, lr, weight_decay, img_size,
 
         # decode (for IoU monitoring)
         if use_dfl:
-            reg_logits_flat = reg_o.permute(0, 2, 3, 1).reshape(B, -1, 4 * bins)
-            reg = dfl_project(reg_logits_flat, bins).clamp(min=0)
+            reg_logits = reg_o.permute(0, 2, 3, 1).reshape(B, -1, 4 * bins)
+            reg = dfl_project(reg_logits, bins).clamp(min=0)
         else:
             reg = reg_o.permute(0, 2, 3, 1).reshape(B, -1, 4).clamp(min=0)
 
         boxes_pred = dist2bbox_ltbr(reg, cxv, cyv).view(B, -1, 4).clamp(0, img_size)
 
-        # targets (pos_expand 사용)
+        # targets
         obj_tgt, pos_mask_flat = make_targets(boxes_list, cx, cy, B, stride=s, pos_expand=pos_expand)
 
         # DFL loss (양성 포인트에 대해 stride-정규화 거리 타깃 구축)
         dfl_loss = torch.tensor(0.0, device=device)
         if use_dfl and pos_mask_flat.any():
             dist_targets = torch.zeros((B, H * W, 4), device=device)
-            for bb in range(B):  # 배치 인덱스: bb
-                pos = pos_mask_flat[bb]  # [HW] bool
+            for b in range(B):
+                pos = pos_mask_flat[b]  # bool
                 if not pos.any():
                     continue
-                gts = boxes_list[bb].to(device)  # [Ng,4]
+                gts = boxes_list[b].to(device)
                 if gts.numel() == 0:
                     continue
 
                 # 각 포인트 → 가장 가까운 GT center로 배정
                 gxc = (gts[:, 0] + gts[:, 2]) / 2
                 gyc = (gts[:, 1] + gts[:, 3]) / 2
-                cpos = torch.stack([cxv[pos], cyv[pos]], dim=1)   # [P,2]
-                cgt  = torch.stack([gxc, gyc], dim=1)            # [Ng,2]
-                d2 = (cpos[:, None, :] - cgt[None, :, :]).pow(2).sum(-1)  # [P,Ng]
-                nn_idx = d2.argmin(dim=1)  # [P] 각 포인트가 매칭할 GT 인덱스
+                cpos = torch.stack([cxv[pos], cyv[pos]], dim=1)  # [P,2]
+                cgt = torch.stack([gxc, gyc], dim=1)             # [N,2]
+                d2 = (cpos[:, None, :] - cgt[None, :, :]).pow(2).sum(-1)  # [P,N]
+                idx = d2.argmin(dim=1)  # [P]
 
-                # 매칭된 GT들에서 거리 타깃 계산 (stride 정규화)
-                x1 = gts[nn_idx, 0]; y1 = gts[nn_idx, 1]
-                x2 = gts[nn_idx, 2]; y2 = gts[nn_idx, 3]
+                x1 = gts[idx, 0]; y1 = gts[idx, 1]; x2 = gts[idx, 2]; y2 = gts[idx, 3]
                 cxp = cxv[pos]; cyp = cyv[pos]
 
                 l = (cxp - x1) / s
                 t = (cyp - y1) / s
                 r = (x2 - cxp) / s
-                btm = (y2 - cyp) / s   # ← 'b' 대신 'btm'로
+                b = (y2 - cyp) / s
+                dist_targets[b, pos] = torch.stack([l, t, r, b], dim=1)
 
-                dist_targets[bb, pos] = torch.stack([l, t, r, btm], dim=1)
-
-            # raw logits(reg_o)로 감독
+            # raw logits로 감독해야 함
             dfl_loss = dfl_crit(reg_o, dist_targets, pos_mask_flat)
 
-        # obj/cls BCE
-        l_obj = bce(obj_o, obj_tgt)
-        l_cls = bce(cls_o, obj_tgt.expand_as(cls_o))
+        # obj/cls
+        l_obj = obj_crit(obj_o, obj_tgt)
+        l_cls = cls_crit(cls_o, obj_tgt.expand_as(cls_o))
 
-        # IoU loss on positives (모니터링)
+        # IoU loss on positives (모니터링용 간략)
         l_box = torch.tensor(0.0, device=device)
         if pos_mask_flat.any():
             ious_all = []
@@ -265,15 +294,14 @@ def train_one_epoch(model, loader, device, lr, weight_decay, img_size,
             if ious_all:
                 l_box = torch.stack(ious_all).mean()
 
-        loss = 1.0 * l_box + 1.2 * l_obj + 0.4 * l_cls + ((dfl_weight * dfl_loss) if use_dfl else 0.0)
+        loss = 1.0 * l_box + 1.2 * l_obj + 0.4 * l_cls + ((0.5 * dfl_loss) if use_dfl else 0.0)
 
         opt.zero_grad()
         loss.backward()
         opt.step()
 
         sm_loss = loss.item() if sm_loss is None else (ema * sm_loss + (1 - ema) * loss.item())
-        pbar.set_postfix(loss=f"{sm_loss:.3f}", box=f"{l_box.item():.3f}",
-                         obj=f"{l_obj.item():.3f}", cls=f"{l_cls.item():.3f}",
+        pbar.set_postfix(loss=f"{sm_loss:.3f}", box=f"{l_box.item():.3f}", obj=f"{l_obj.item():.3f}", cls=f"{l_cls.item():.3f}",
                          dfl=(f"{dfl_loss.item():.3f}" if use_dfl else "-"))
 
         if csv_writer is not None and (it % 10 == 0):
@@ -281,6 +309,7 @@ def train_one_epoch(model, loader, device, lr, weight_decay, img_size,
                                  float(loss.item()), float(l_box.item()),
                                  float(l_obj.item()), float(l_cls.item()),
                                  float(dfl_loss.item() if use_dfl else 0.0)])
+
 
 # =========================
 # Main
@@ -295,7 +324,6 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[device] {device}")
-    print(f"[cfg] dfl_weight={args.dfl_weight} | pos_expand={args.pos_expand} | bins={args.bins}")
 
     # Dataset / Loader
     train_ds = YOLOTxtPlateDataset(TRAIN_IMGS, TRAIN_LBLS, args.imgsz)
@@ -328,18 +356,20 @@ def main():
                             img_size=args.imgsz,
                             epoch_idx=ep, epochs=args.epochs,
                             use_dfl=bool(args.use_dfl), bins=args.bins,
-                            dfl_weight=args.dfl_weight, pos_expand=args.pos_expand,
+                            use_focal=bool(args.loss_focal), focal_alpha=args.focal_alpha, focal_gamma=args.focal_gamma,
+                            pos_expand=args.pos_expand,
                             csv_writer=csv_writer)
 
-            # save per-epoch (run 폴더 안)
-            ck = CK_DIR / f"lp_fuse_ep{ep:03d}.pt"
+            # save per-epoch
+            ck = DATA_ROOT.parent / f"lp_fuse_ep{ep:03d}.pt"
             torch.save(model.state_dict(), ck)
             print(f"[ckpt] {ck}")
 
     # save final
-    out_w = RUN_DIR / "lp_yolo_fuse_lp.pt"
+    out_w = DATA_ROOT.parent / "lp_yolo_fuse_lp.pt"
     torch.save(model.state_dict(), out_w)
     print(f"[save] {out_w}")
+
 
 if __name__ == "__main__":
     main()
