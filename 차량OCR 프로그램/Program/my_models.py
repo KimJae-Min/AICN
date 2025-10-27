@@ -68,13 +68,17 @@ def group_by_chars(ocr_result, y_thresh=10):
     return sorted_texts
 
 def detect_car_plate(img_path, car_m, lp_m, ocr_model):
+    """
+    번호판 인식 + 번호판 크롭 이미지 리턴
+    """
     try:
         im_pil = Image.open(img_path).convert("RGB")
     except (UnidentifiedImageError, OSError):
-        return ["인식 불가 (이미지 파일 아님)"]
+        return ["인식 불가 (이미지 파일 아님)"], []
 
     img = np.array(im_pil)
     result_text = []
+    plate_imgs = []
 
     locs = car_m(im_pil).xyxy[0]
     if len(locs) > 0:
@@ -84,20 +88,22 @@ def detect_car_plate(img_path, car_m, lp_m, ocr_model):
             lp_results = lp_m(Image.fromarray(car_crop))
             for lp in lp_results.xyxy[0]:
                 lx1, ly1, lx2, ly2 = [int(t.cpu().detach().numpy()) for t in lp[:4]]
-                plate_crop = deskew_plate(car_crop[ly1:ly2, lx1:lx2])
-                plate_crop = cv2.resize(plate_crop, (224,128))
-                gray = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
-                ocr_results = ocr_model.ocr(cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR), cls=True)
+                plate_crop = car_crop[ly1:ly2, lx1:lx2].copy()
+                # deskew 후 gray 변환
+                gray_plate = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
+                plate_imgs.append(gray_plate)
+                ocr_results = ocr_model.ocr(cv2.cvtColor(gray_plate, cv2.COLOR_GRAY2BGR), cls=True)
                 if ocr_results and ocr_results[0]:
-                    combined = ''.join(group_by_chars(ocr_results[0])).replace(',', '').replace('，','').replace('-','').replace('－','')
-                    result_text.append(combined)
+                    text = ''.join([t[1][0] for t in ocr_results[0]]).replace(',', '').replace('-', '')
+                    result_text.append(text)
 
     if not result_text:
+        # 전체 이미지 OCR fallback
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         ocr_full = ocr_model.ocr(cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR), cls=True)
         if ocr_full and ocr_full[0]:
-            result_text = [''.join(group_by_chars(ocr_full[0])).replace(',', '').replace('，','').replace('-','').replace('－','')]
+            result_text = [''.join([t[1][0] for t in ocr_full[0]]).replace(',', '').replace('-', '')]
         else:
             result_text = ["인식 실패"]
 
-    return result_text
+    return result_text, plate_imgs
