@@ -1,4 +1,3 @@
- (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
 diff --git a/차량OCR 프로그램/Program/my_models.py b/차량OCR 프로그램/Program/my_models.py
 index 78e69544f852650a5df63a936547f2dc21d8abea..3bc38e5213ac146f299ca51574ac7cf8269221a5 100644
 --- a/차량OCR 프로그램/Program/my_models.py	
@@ -731,6 +730,3 @@ index 78e69544f852650a5df63a936547f2dc21d8abea..3bc38e5213ac146f299ca51574ac7cf8
  
 -    return result_text, plate_imgs
 +    return texts, plate_imgs
- 
-EOF
-)
