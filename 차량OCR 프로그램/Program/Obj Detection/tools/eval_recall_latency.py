@@ -1,12 +1,5 @@
-# tools/eval_recall_latency.py
 # -*- coding: utf-8 -*-
-"""
-PSA/DFL 자동 감지 평가 스크립트
-- PSA: 가중치 로드 실패 시 자동 OFF 재시도(또는 옵션으로 강제)
-- DFL: state_dict에서 자동 추정(없으면 추론단에서 reg 채널 수로 자동 처리)
-"""
-
-import time, argparse
+import argparse, time, csv
 from pathlib import Path
 
 import numpy as np
@@ -17,17 +10,15 @@ from torchvision.ops import nms
 from src.model import LP_YOLO_Fuse
 from src.utils_common import dist2bbox_ltbr
 
-
-# ---------------------------
-# I/O utils
-# ---------------------------
+# ------------------------
+# IO / utils
+# ------------------------
 def load_img(path, imgsz):
     im = Image.open(path).convert("RGB")
     im = im.resize((imgsz, imgsz), Image.BILINEAR)
     arr = np.array(im, dtype=np.float32) / 255.0
     img = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).contiguous()  # [1,3,H,W]
-    return img, im
-
+    return img, im  # tensor, PIL(resized)
 
 def build_grid_xy(H, W, stride, device):
     ys = torch.arange(H, device=device) + 0.5
@@ -35,87 +26,145 @@ def build_grid_xy(H, W, stride, device):
     cy, cx = torch.meshgrid(ys, xs, indexing='ij')
     return (cx * stride).view(-1), (cy * stride).view(-1)  # [HW],[HW]
 
-
 def read_gt_txt(txt_path, imgsz):
     if not txt_path.exists():
         return torch.zeros((0, 4), dtype=torch.float32)
     lines = [l.strip() for l in txt_path.read_text(encoding="utf-8", errors="ignore").splitlines() if l.strip()]
     boxes = []
     for l in lines:
-        c, cx, cy, w, h = l.split()
-        cx, cy, w, h = map(float, (cx, cy, w, h))
-        x1 = (cx - w / 2) * imgsz
-        y1 = (cy - h / 2) * imgsz
-        x2 = (cx + w / 2) * imgsz
-        y2 = (cy + h / 2) * imgsz
+        parts = l.split()
+        if len(parts) < 5:
+            continue
+        _, cx, cy, w, h = map(float, parts[:5])
+        x1 = (cx - w/2) * imgsz
+        y1 = (cy - h/2) * imgsz
+        x2 = (cx + w/2) * imgsz
+        y2 = (cy + h/2) * imgsz
         boxes.append([x1, y1, x2, y2])
     if not boxes:
         return torch.zeros((0, 4), dtype=torch.float32)
     return torch.tensor(boxes, dtype=torch.float32)
 
-
-# ---------------------------
-# DFL utils
-# ---------------------------
-def infer_dfl_from_ckpt(sd):
-    """
-    state_dict의 reg 헤드 마지막 conv out-ch으로 DFL 사용 여부/빈수 추정.
-    - reg_o.1.weight 또는 reg_m.1.weight 찾음
-    """
-    cand = [k for k in sd.keys() if k.endswith("reg_o.1.weight") or k.endswith("reg_m.1.weight")]
-    for k in cand:
-        v = sd[k]
-        if v.ndim == 4:
-            out_ch = v.shape[0]
-            if out_ch != 4 and out_ch % 4 == 0:
-                return True, out_ch // 4
-            else:
-                return False, 8
-    return False, 8
-
-
-def dfl_project(reg_logits, bins: int):
-    """
-    reg_logits: [B, HW, 4*bins] → 기대값 기반 거리 [B, HW, 4]
-    """
-    B = reg_logits.shape[0]
-    x = reg_logits.view(B, -1, 4, bins)               # [B, HW, 4, bins]
-    prob = torch.softmax(x, dim=-1)                   # softmax over bins
-    idx = torch.arange(bins, device=reg_logits.device, dtype=torch.float32)
-    dist = (prob * idx).sum(dim=-1)                   # [B, HW, 4]
-    return dist
-
-
-# ---------------------------
-# Inference
-# ---------------------------
 @torch.no_grad()
-def infer_one(model, img, conf_thr=0.2, iou_thr=0.5):
+def iou_matrix(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-9):
+    device = a.device
+    b = b.to(device, non_blocking=True)
+    if a.numel() == 0 or b.numel() == 0:
+        return torch.zeros((a.shape[0], b.shape[0]), device=device)
+
+    x1 = torch.max(a[:, None, 0], b[None, :, 0])
+    y1 = torch.max(a[:, None, 1], b[None, :, 1])
+    x2 = torch.min(a[:, None, 2], b[None, :, 2])
+    y2 = torch.min(a[:, None, 3], b[None, :, 3])
+
+    inter = (x2 - x1).clamp(min=0) * (y2 - y1).clamp(min=0)
+    aa = (a[:, 2] - a[:, 0]).clamp(min=0) * (a[:, 3] - a[:, 1]).clamp(min=0)
+    bb = (b[:, 2] - b[:, 0]).clamp(min=0) * (b[:, 3] - b[:, 1]).clamp(min=0)
+    return inter / (aa[:, None] + bb[None, :] - inter + eps)
+
+# ------------------------
+# PSA/DFL 자동감지
+# ------------------------
+def sniff_ckpt_cfg(sd):
+    # DFL bins 추론 (out_ch/4)
+    bins = None
+    for key in ("head.reg_o.1.bias", "head.reg_m.1.bias"):
+        if key in sd and isinstance(sd[key], torch.Tensor):
+            out_ch = int(sd[key].numel())
+            if out_ch % 4 == 0:
+                bins = out_ch // 4
+                break
+    has_psa = ("neck.psa.conv.weight" in sd) or ("neck.psa.conv.bias" in sd)
+    use_dfl = (bins is not None and bins > 1)
+    if bins is None:
+        bins = 1
+    return has_psa, use_dfl, bins
+
+# ------------------------
+# 헤드 선택 유틸
+# ------------------------
+def pick_head(outputs, prefer: str = "auto", psa_on: bool = False):
+    """
+    outputs: out["o2m"], out["o2o"]
+    prefer : 'm' | 'o' | 'auto'
+    psa_on : 모델이 PSA 켜고 학습된 플래그
+    반환: (reg, obj, cls, tag)
+    """
+    (reg_m, obj_m, cls_m), (reg_o, obj_o, cls_o) = outputs
+    if prefer == "m":
+        return reg_m, obj_m, cls_m, "m"
+    if prefer == "o":
+        return reg_o, obj_o, cls_o, "o"
+
+    # auto: PSA면 m 우선, 아니면 o 우선. 둘 다 스코어 낮으면 평균 obj가 더 큰 쪽 선택
+    pri = [("m", reg_m, obj_m, cls_m), ("o", reg_o, obj_o, cls_o)]
+    pri = pri if psa_on else pri[::-1]  # PSA면 m 먼저, 아니면 o 먼저
+    chosen = None
+    for tag, rr, oo, cc in pri:
+        try:
+            if torch.isfinite(oo).all():
+                chosen = (rr, oo, cc, tag)
+                break
+        except Exception:
+            pass
+    if chosen is None:
+        # 평균 obj로 최종 백업 선택
+        cand = []
+        for tag, rr, oo, cc in [("m", reg_m, obj_m, cls_m), ("o", reg_o, obj_o, cls_o)]:
+            try:
+                score = torch.sigmoid(oo).mean().item()
+            except Exception:
+                score = -1e9
+            cand.append((score, rr, oo, cc, tag))
+        cand.sort(reverse=True, key=lambda x: x[0])
+        _, rr, oo, cc, tag = cand[0]
+        chosen = (rr, oo, cc, tag)
+    return chosen
+
+# ------------------------
+# 추론 1장 (DFL/Plain 자동 대응 + 헤드선택)
+# ------------------------
+@torch.no_grad()
+def infer_one(model, img, conf_thr=0.2, iou_match=0.5, nms_iou=0.5, keep_topk=None,
+              score_mode="objcls", prefer_head="auto"):
     device = next(model.parameters()).device
-    img = img.to(device)
+    img = img.to(device, non_blocking=True)
 
     t0 = time.perf_counter()
     out = model(img)
-    (reg_m, obj_m, cls_m), (reg_o, obj_o, cls_o) = out["o2m"], out["o2o"]
+    reg_o, obj_o, cls_o, used = pick_head(
+        (out["o2m"], out["o2o"]),
+        prefer=prefer_head,
+        psa_on=bool(getattr(model, "use_psa", False))
+    )
     t1 = time.perf_counter()
 
     B, _, H, W = obj_o.shape
     s = model.stride
     cx, cy = build_grid_xy(H, W, s, device)  # [HW]
 
-    # ---- DFL 자동 처리: 채널 수로 판단 ----
-    if reg_o.shape[1] == 4:
-        reg = reg_o.permute(0, 2, 3, 1).reshape(B, -1, 4).clamp(min=0)     # [B,HW,4]
+    # DFL / LTRB decode
+    if getattr(model, "use_dfl", False) and int(getattr(model, "bins", 1)) > 1:
+        bins = int(model.bins)
+        reg_logits = reg_o.permute(0, 2, 3, 1).reshape(B, -1, 4 * bins)  # [B,HW,4*bins]
+        x = reg_logits.view(B, -1, 4, bins)
+        prob = torch.softmax(x, dim=-1)
+        idx = torch.arange(bins, device=device, dtype=torch.float32)
+        reg = (prob * idx).sum(dim=-1).clamp(min=0)  # [B,HW,4]
     else:
-        bins = reg_o.shape[1] // 4
-        reg_logits = reg_o.permute(0, 2, 3, 1).reshape(B, -1, 4 * bins)     # [B,HW,4*bins]
-        reg = dfl_project(reg_logits, bins).clamp(min=0)                    # [B,HW,4]
+        reg = reg_o.permute(0, 2, 3, 1).contiguous().view(B, H*W, 4).clamp(min=0)  # [B,HW,4]
 
-    boxes = dist2bbox_ltbr(reg[0], cx, cy)                                  # [HW,4] (px)
-    scores_obj = torch.sigmoid(obj_o[0, 0].flatten())
-    scores_cls = torch.sigmoid(cls_o[0, 0].flatten())                       # 단일 클래스
-    scores = scores_obj * scores_cls
+    boxes = dist2bbox_ltbr(reg[0], cx, cy)  # [HW,4] (px)
 
+    # scores
+    scores_obj = torch.sigmoid(obj_o[0, 0].flatten())        # [HW]
+    if score_mode == "obj":
+        scores = scores_obj
+    else:
+        scores_cls = torch.sigmoid(cls_o[0, 0].flatten())    # 1-class
+        scores = scores_obj * scores_cls
+
+    # thresholding
     mask = scores > conf_thr
     if mask.sum() == 0:
         return torch.zeros((0, 4), device=device), torch.zeros((0,), device=device), (t1 - t0) * 1000.0
@@ -123,117 +172,205 @@ def infer_one(model, img, conf_thr=0.2, iou_thr=0.5):
     boxes = boxes[mask]
     scores = scores[mask]
 
-    keep = nms(boxes, scores, iou_thr)
+    # NMS
+    keep = nms(boxes, scores, nms_iou)
+    if keep_topk is not None and keep_topk > 0:
+        keep = keep[:keep_topk]
     boxes = boxes[keep]
     scores = scores[keep]
 
     latency_ms = (t1 - t0) * 1000.0
     return boxes, scores, latency_ms
 
+# ------------------------
+# 케이스 평가
+# ------------------------
+@torch.no_grad()
+def evaluate_case(model, img_paths, lbldir, imgsz, conf, nms_iou, keep_topk, iou_match, score_mode, prefer_head):
+    TP = 0; FP = 0; FN = 0
+    lat_list = []
+    total_gt = 0
 
-def iou_matrix(a, b, eps=1e-9):
-    if a.numel() == 0 or b.numel() == 0:
-        return torch.zeros((a.shape[0], b.shape[0]), device=a.device)
-    x1 = torch.max(a[:, None, 0], b[None, :, 0]); y1 = torch.max(a[:, None, 1], b[None, :, 1])
-    x2 = torch.min(a[:, None, 2], b[None, :, 2]); y2 = torch.min(a[:, None, 3], b[None, :, 3])
-    inter = (x2 - x1).clamp(min=0) * (y2 - y1).clamp(min=0)
-    aa = (a[:, 2] - a[:, 0]).clamp(min=0) * (a[:, 3] - a[:, 1]).clamp(min=0)
-    bb = (b[:, 2] - b[:, 0]).clamp(min=0) * (b[:, 3] - b[:, 1]).clamp(min=0)
-    return inter / (aa[:, None] + bb[None, :] - inter + eps)
+    for i, ip in enumerate(img_paths, 1):
+        lp = lbldir / f"{ip.stem}.txt"
+        gt = read_gt_txt(lp, imgsz)     # [Ng,4] (cpu)
+        img, _ = load_img(ip, imgsz)    # [1,3,H,W] (cpu)
 
+        boxes, scores, lat_ms = infer_one(
+            model, img, conf, iou_match, nms_iou,
+            keep_topk, score_mode=score_mode, prefer_head=prefer_head
+        )
+        lat_list.append(lat_ms)
 
-# ---------------------------
-# Main
-# ---------------------------
-def main():
+        Ng = gt.shape[0]
+        Np = boxes.shape[0]
+        total_gt += Ng
+
+        if Np == 0 and Ng == 0:
+            pass
+        elif Np == 0 and Ng > 0:
+            FN += Ng
+        elif Np > 0 and Ng == 0:
+            FP += Np
+        else:
+            imat = iou_matrix(boxes, gt)  # [Np,Ng] (자동 device 맞춤)
+            max_iou_pred = imat.max(dim=1).values
+            max_iou_gt   = imat.max(dim=0).values
+
+            tp_here = int((max_iou_gt >= iou_match).sum().item())
+            fp_here = int((max_iou_pred <  iou_match).sum().item())
+            fn_here = Ng - tp_here
+
+            TP += tp_here; FP += fp_here; FN += fn_here
+
+        if i % 200 == 0:
+            prec = (TP/(TP+FP)) if (TP+FP)>0 else 0.0
+            rec  = (TP/total_gt) if total_gt>0 else 0.0
+            print(f"[eval] {i}/{len(img_paths)}  P={prec:.3f} R={rec:.3f}  Lat~{np.mean(lat_list):.1f}ms")
+
+    precision = (TP/(TP+FP)) if (TP+FP)>0 else 0.0
+    recall = (TP/total_gt) if total_gt>0 else 0.0
+    f1 = (2*precision*recall/(precision+recall)) if (precision+recall)>0 else 0.0
+    avg_lat = float(np.mean(lat_list)) if lat_list else 0.0
+
+    return dict(TP=TP, FP=FP, FN=FN, GT=total_gt,
+                precision=precision, recall=recall, f1=f1, avg_lat=avg_lat)
+
+# ------------------------
+# 파라미터 파서(범위/리스트)
+# ------------------------
+def parse_list_arg(s: str, cast=float):
+    s = s.strip()
+    if ":" in s:
+        a, step, b = s.split(":")
+        a = cast(a); step = cast(step); b = cast(b)
+        vals = []
+        cur = a
+        while cur <= b + (1e-9 if cast is float else 0):
+            vals.append(cast(round(cur, 10)) if cast is float else cast(cur))
+            cur += step
+        return vals
+    else:
+        return [cast(x) for x in s.split(",") if x.strip()]
+
+# ------------------------
+# 메인
+# ------------------------
+def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_root", default=r"C:/Users/win/Desktop/lp_yolo_fuse/data")
-    ap.add_argument("--weights",   default=r"C:/Users/win/Desktop/lp_yolo_fuse/lp_yolo_fuse_lp.pt")
+    ap.add_argument("--weights", required=True)
     ap.add_argument("--imgsz", type=int, default=512)
-    ap.add_argument("--conf",  type=float, default=0.2)
-    ap.add_argument("--iou",   type=float, default=0.5)
-    ap.add_argument("--max_eval", type=int, default=5000, help="최대 평가 이미지 수(빠른 확인용)")
+    ap.add_argument("--max_eval", type=int, default=20000)
+    ap.add_argument("--iou", type=float, default=0.5, help="matching IoU for metrics")
 
-    # ▼ 자동/강제 옵션: -1=auto, 0/1=강제
-    ap.add_argument("--use_psa", type=int, default=-1, help="-1:auto, 0:off, 1:on")
-    ap.add_argument("--use_dfl", type=int, default=-1, help="-1:auto, 0:off, 1:on")
-    ap.add_argument("--bins",    type=int, default=8)
-    args = ap.parse_args()
+    # Sweep spaces (단일 평가에도 그대로 사용 가능)
+    ap.add_argument("--confs", default="0.28", help="ex) '0.20:0.05:0.50' or '0.20,0.25'")
+    ap.add_argument("--nms_ious", default="0.30", help="ex) '0.30,0.45'")
+    ap.add_argument("--keep_topks", default="1", help="ex) '1,2' or '0'")
 
-    root   = Path(args.data_root)
-    imgdir = root / "images/val"
-    lbldir = root / "labels/val"
+    # Score & Head
+    ap.add_argument("--score_mode", choices=["obj","objcls"], default="objcls")
+    ap.add_argument("--prefer_head", choices=["auto","m","o"], default="auto",
+                    help="PSA 모델은 'm', 일반은 'o' 권장. 'auto'는 플래그/스코어로 자동선택")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # 강제 오버라이드(없으면 ckpt에서 자동감지)
+    ap.add_argument("--force_psa", type=int, default=-1)
+    ap.add_argument("--force_dfl", type=int, default=-1)
+    ap.add_argument("--force_bins", type=int, default=-1)
 
-    # ---- 가중치 로드 ----
-    ckpt = torch.load(args.weights, map_location=device, weights_only=True)
-    sd   = ckpt if isinstance(ckpt, dict) else ckpt
+    # Output
+    ap.add_argument("--run", default="sweep")
+    ap.add_argument("--out_dir", default="")           # 기본: DATA_ROOT.parent
+    ap.add_argument("--xlsx", type=int, default=0)
+    ap.add_argument("--notes", default="")
+    return ap.parse_args()
 
-    # ---- DFL 자동 추정 또는 강제 ----
-    if args.use_dfl == -1:
-        use_dfl, bins = infer_dfl_from_ckpt(sd)
-    else:
-        use_dfl = bool(args.use_dfl); bins = int(args.bins)
+def main():
+    args = parse_args()
 
-    # ---- PSA 자동/강제: 먼저 ON 시도, 실패 시 OFF 재시도 ----
-    psa_pref = args.use_psa  # -1/0/1
+    # Output dirs
+    DATA_ROOT = Path(args.data_root)
+    base_out = Path(args.out_dir) if args.out_dir else DATA_ROOT.parent
+    RUN_DIR = base_out / f"runs_{args.run}"
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    CSV_PATH = RUN_DIR / "sweep_results.csv"
+    XLSX_PATH = RUN_DIR / "sweep_results.xlsx"
 
-    def build(psa_flag: bool):
-        return LP_YOLO_Fuse(in_ch=3, num_classes=1, use_psa=psa_flag, use_dfl=use_dfl, bins=bins).to(device)
-
-    psa_try_on = (True if psa_pref == -1 else bool(psa_pref))
-    model = build(psa_try_on)
-    loaded_with_psa = psa_try_on
-    try:
-        model.load_state_dict(sd, strict=True)
-    except RuntimeError as e:
-        if ("neck.psa" in str(e)) and (psa_pref != 1):
-            model = build(False)
-            model.load_state_dict(sd, strict=False)
-            loaded_with_psa = False
-        else:
-            model.load_state_dict(sd, strict=False)
-    model.eval()
-
-    print(f"[model] device={device} | stride={getattr(model, 'stride', 'N/A')} | PSA={loaded_with_psa} | DFL={use_dfl} (bins={bins})")
-
+    # Data
+    imgdir = DATA_ROOT / "images/val"
+    lbldir = DATA_ROOT / "labels/val"
     img_paths = sorted([p for p in imgdir.glob("*") if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]])
     if args.max_eval and len(img_paths) > args.max_eval:
         img_paths = img_paths[:args.max_eval]
 
-    total_gt = 0
-    total_tp = 0
-    lat_list = []
+    # Load weights
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # weights_only=True 가 버전별 이슈가 있을 수 있어서 기본값 사용
+    ckpt = torch.load(args.weights, map_location=device)
+    if isinstance(ckpt, dict) and "state_dict" in ckpt:
+        sd = ckpt["state_dict"]
+    else:
+        sd = ckpt
 
-    for i, ip in enumerate(img_paths, 1):
-        lp = lbldir / f"{ip.stem}.txt"
-        gt = read_gt_txt(lp, args.imgsz).to(device)   # [Ng,4]
+    has_psa, use_dfl_auto, bins_auto = sniff_ckpt_cfg(sd)
+    use_psa = bool(args.force_psa) if args.force_psa in (0, 1) else has_psa
+    use_dfl = bool(args.force_dfl) if args.force_dfl in (0, 1) else use_dfl_auto
+    bins = int(args.force_bins) if args.force_bins > 0 else int(bins_auto)
+    print(f"[ckpt-config] PSA={use_psa} | DFL={use_dfl} | bins={bins}")
 
-        img, _ = load_img(ip, args.imgsz)
-        boxes, scores, lat_ms = infer_one(model, img, args.conf, args.iou)
+    model = LP_YOLO_Fuse(in_ch=3, num_classes=1, use_psa=use_psa, use_dfl=use_dfl, bins=bins).to(device)
+    missing = model.load_state_dict(sd, strict=False)
+    if isinstance(missing, tuple):
+        miss, unexp = missing
+        print(f"[load] missing={len(miss)}, unexpected={len(unexp)}")
+    else:
+        print("[load] state_dict loaded")
+    model.eval()
 
-        lat_list.append(lat_ms)
-        total_gt += gt.shape[0]
+    # Sweep space
+    conf_list = parse_list_arg(args.confs, float)
+    nms_list = parse_list_arg(args.nms_ious, float)
+    topk_list = parse_list_arg(args.keep_topks, int)
 
-        if gt.numel() and boxes.numel():
-            ious = iou_matrix(boxes, gt)             # [Np,Ng]
-            max_iou_per_gt = ious.max(dim=0).values
-            total_tp += int((max_iou_per_gt >= 0.5).sum().item())
+    total_cases = len(conf_list) * len(nms_list) * len(topk_list)
+    print(f"[sweep] cases = {len(conf_list)} x {len(nms_list)} x {len(topk_list)} = {total_cases}")
 
-        if i % 200 == 0:
-            rec = (total_tp/total_gt) if total_gt>0 else 0.0
-            print(f"[eval] {i}/{len(img_paths)}  TP/GT={total_tp}/{total_gt}  Recall={rec:.4f}  Lat(ms)~{np.mean(lat_list):.1f}")
+    with open(CSV_PATH, "w", newline="", encoding="utf-8") as fcsv:
+        w = csv.writer(fcsv)
+        w.writerow(["run", "notes", "imgsz", "iou_match",
+                    "conf", "nms_iou", "keep_topk", "prefer_head", "score_mode",
+                    "TP", "FP", "FN", "GT",
+                    "precision", "recall", "f1", "avg_lat_ms"])
 
-    recall = (total_tp/total_gt) if total_gt>0 else 0.0
-    avg_lat = float(np.mean(lat_list)) if lat_list else 0.0
+        case_id = 0
+        for conf in conf_list:
+            for nms_iou in nms_list:
+                for keep_topk in topk_list:
+                    case_id += 1
+                    print(f"\n=== Case {case_id}/{total_cases} :: conf={conf} | nms_iou={nms_iou} | keep_topk={keep_topk} | head={args.prefer_head} ===")
+                    metrics = evaluate_case(
+                        model, img_paths, lbldir,
+                        imgsz=args.imgsz,
+                        conf=conf, nms_iou=nms_iou, keep_topk=(None if keep_topk == 0 else keep_topk),
+                        iou_match=args.iou, score_mode=args.score_mode, prefer_head=args.prefer_head
+                    )
+                    w.writerow([args.run, args.notes, args.imgsz, args.iou,
+                                conf, nms_iou, keep_topk, args.prefer_head, args.score_mode,
+                                metrics["TP"], metrics["FP"], metrics["FN"], metrics["GT"],
+                                f'{metrics["precision"]:.6f}', f'{metrics["recall"]:.6f}', f'{metrics["f1"]:.6f}',
+                                f'{metrics["avg_lat"]:.3f}'])
 
-    print("\n===== EVAL RESULT =====")
-    print(f"Images      : {len(img_paths)}")
-    print(f"GT Boxes    : {total_gt}")
-    print(f"True Pos    : {total_tp}")
-    print(f"Recall@0.5  : {recall:.4f}")
-    print(f"Avg Latency : {avg_lat:.1f} ms  (batch=1)")
+    print(f"\n[save] CSV: {CSV_PATH}")
+    if int(args.xlsx) == 1:
+        try:
+            import pandas as pd
+            df = pd.read_csv(CSV_PATH)
+            with pd.ExcelWriter(XLSX_PATH, engine="xlsxwriter") as xw:
+                df.to_excel(xw, index=False, sheet_name="results")
+            print(f"[save] XLSX: {XLSX_PATH}")
+        except Exception as e:
+            print(f"[pandas] 건너뜀({e}). CSV만 저장됨: {CSV_PATH}")
 
 if __name__ == "__main__":
     main()
