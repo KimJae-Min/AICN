@@ -110,7 +110,7 @@ def load_models_cached():
 # Main
 # ==============================
 def main():
-    car_m, lp_m, ocr_model = load_models_cached()
+    plate_detector, ocr_bundle = load_models_cached()
 
     if 'file_info' not in st.session_state:
         st.session_state['file_info'] = []
@@ -166,7 +166,7 @@ def main():
                             continue
                         st.session_state['processed_files'].add(file_key)
 
-                        plates, plate_imgs = detect_car_plate(fp, car_m, lp_m, ocr_model)
+                        plates, plate_imgs = detect_car_plate(fp, plate_detector, ocr_bundle)
                         infos.append({
                             'capture_time': get_image_date(fp).strftime('%Y-%m-%d %H:%M:%S'),
                             'name': file_key,
