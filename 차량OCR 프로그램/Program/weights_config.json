@@ -1,0 +1,4 @@
+{
+  "plate_detector": "plate_detector.pt",
+  "ocr": "ocr_model.pt"
+}

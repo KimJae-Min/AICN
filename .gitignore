@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+차량OCR 프로그램/Program/dist/
+차량OCR 프로그램/Program/plate_crops/
