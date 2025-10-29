@@ -1,16 +1,22 @@
-import contextlib
-import importlib.util
-import io
+"""Streamlit 앱에서 사용하는 번호판 검출 + OCR 추론 모듈.
+
+사하구청 등 배포 환경에서는 학습용 소스를 함께 전달하지 않아도 되도록
+추론에 필요한 신경망 구조를 이 파일 안에 직접 포함하였다. 가중치 파일만
+교체하면 프로그램이 새로운 모델을 불러온다.
+"""
+
 import json
 import os
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import cv2
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from PIL import Image, UnidentifiedImageError
 
 
@@ -27,49 +33,12 @@ disable_mps()
 
 
 BASE_DIR = Path(__file__).resolve().parent
-OBJ_SRC_DIR = BASE_DIR / "Obj Detection" / "src"
-OCR_SRC_PATH = BASE_DIR / "OCR" / "ocr_model.py"
-
-
-def _load_module(name: str, path: Path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Failed to load module from {path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)  # type: ignore[attr-defined]
-    return module
-
-
-_lp_model_mod = None
-_lp_utils_mod = None
-_ocr_mod = None
-
-
-def _get_detection_modules():
-    global _lp_model_mod, _lp_utils_mod
-    if _lp_model_mod is None or _lp_utils_mod is None:
-        if not OBJ_SRC_DIR.exists():
-            raise FileNotFoundError("Obj Detection/src 폴더가 없습니다. 학습한 번호판 검출 코드가 필요합니다.")
-        _lp_model_mod = _load_module("lp_model", OBJ_SRC_DIR / "model.py")
-        _lp_utils_mod = _load_module("lp_utils", OBJ_SRC_DIR / "utils_common.py")
-    return _lp_model_mod, _lp_utils_mod
-
-
-def _get_ocr_module():
-    global _ocr_mod
-    if _ocr_mod is None:
-        if not OCR_SRC_PATH.exists():
-            raise FileNotFoundError("OCR/ocr_model.py를 찾을 수 없습니다. 학습한 OCR 코드가 필요합니다.")
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            _ocr_mod = _load_module("ocr_model", OCR_SRC_PATH)
-    return _ocr_mod
 
 
 @dataclass
 class OCRBundle:
     model: torch.nn.Module
-    charset: object
+    charset: "Charset"
     max_length: int
     img_size: Tuple[int, int]
 
@@ -79,6 +48,326 @@ DEFAULT_DET_IMG_SIZE = 512
 DEFAULT_DET_CONF = 0.3
 DEFAULT_DET_IOU = 0.4
 LP_STRIDE = 8
+
+
+# ==============================
+# 번호판 검출 모델 구조 (LP_YOLO_Fuse)
+# ==============================
+def autopad(k: int, p: Optional[int] = None) -> int:
+    return k // 2 if p is None else p
+
+
+class ConvBNAct(nn.Module):
+    def __init__(self, c_in: int, c_out: int, k: int = 1, s: int = 1, g: int = 1, act: bool = True) -> None:
+        super().__init__()
+        self.conv = nn.Conv2d(c_in, c_out, k, s, autopad(k), groups=g, bias=False)
+        self.bn = nn.BatchNorm2d(c_out, eps=1e-3, momentum=0.03)
+        self.act = nn.SiLU(inplace=True) if act else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # noqa: D401
+        return self.act(self.bn(self.conv(x)))
+
+
+class DSConv(nn.Module):
+    """Depthwise-Separable convolution."""
+
+    def __init__(self, c_in: int, c_out: int, k: int = 3, s: int = 1, act: bool = True) -> None:
+        super().__init__()
+        self.dw = nn.Conv2d(c_in, c_in, k, s, autopad(k), groups=c_in, bias=False)
+        self.dw_bn = nn.BatchNorm2d(c_in, eps=1e-3, momentum=0.03)
+        self.pw = nn.Conv2d(c_in, c_out, 1, 1, 0, bias=False)
+        self.pw_bn = nn.BatchNorm2d(c_out, eps=1e-3, momentum=0.03)
+        self.act = nn.SiLU(inplace=True) if act else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.act(self.dw_bn(self.dw(x)))
+        x = self.act(self.pw_bn(self.pw(x)))
+        return x
+
+
+class DSBottleneck(nn.Module):
+    def __init__(self, c: int, k: int = 3, expansion: float = 0.5) -> None:
+        super().__init__()
+        ch = max(8, int(c * expansion))
+        self.cv1 = ConvBNAct(c, ch, k=1, s=1)
+        self.dw = DSConv(ch, ch, k=k, s=1)
+        self.cv2 = ConvBNAct(ch, c, k=1, s=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.cv2(self.dw(self.cv1(x)))
+
+
+class C3k2Lite(nn.Module):
+    def __init__(self, c: int, n: int = 1, use_k5: bool = True) -> None:
+        super().__init__()
+        layers = []
+        for i in range(n):
+            k = 5 if (use_k5 and i % 2 == 1) else 3
+            layers.append(DSBottleneck(c, k=k, expansion=0.5))
+        self.m = nn.Sequential(*layers) if layers else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.m(x)
+
+
+class SPPF_Tiny(nn.Module):
+    def __init__(self, c: int) -> None:
+        super().__init__()
+        self.cv1 = ConvBNAct(c, c, k=1, s=1)
+        self.pool = nn.MaxPool2d(5, 1, 2)
+        self.cv2 = ConvBNAct(c, c, k=1, s=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.cv2(self.pool(self.cv1(x)))
+
+
+class PSALite(nn.Module):
+    def __init__(self, k: int = 7) -> None:
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, k, 1, autopad(k), bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        avg = torch.mean(x, dim=1, keepdim=True)
+        mx, _ = torch.max(x, dim=1, keepdim=True)
+        attention = torch.sigmoid(self.conv(torch.cat([avg, mx], dim=1)))
+        return x * attention
+
+
+class BackboneLite(nn.Module):
+    def __init__(self, in_ch: int = 3, c1: int = 32, c2: int = 64, c3: int = 96) -> None:
+        super().__init__()
+        self.stem = ConvBNAct(in_ch, c1, k=3, s=2)
+        self.stage1 = C3k2Lite(c1, n=1)
+        self.down2 = DSConv(c1, c2, k=3, s=2)
+        self.stage2 = C3k2Lite(c2, n=2)
+        self.down3 = DSConv(c2, c3, k=3, s=2)
+        self.stage3 = C3k2Lite(c3, n=3)
+        self.sppf = SPPF_Tiny(c3)
+        self.out_c = c3
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+        x = self.stage1(x)
+        x = self.down2(x)
+        x = self.stage2(x)
+        x = self.down3(x)
+        x = self.stage3(x)
+        return self.sppf(x)
+
+
+class NeckPANLite(nn.Module):
+    def __init__(self, c_in: int = 96, c_mid: int = 32, use_psa: bool = True) -> None:
+        super().__init__()
+        self.lateral = ConvBNAct(c_in, c_mid, k=1, s=1)
+        self.merge = C3k2Lite(c_mid, n=1)
+        self.psa = PSALite(k=7) if use_psa else nn.Identity()
+        self.out_c = c_mid
+
+    def forward(self, p3: torch.Tensor) -> torch.Tensor:
+        y = self.lateral(p3)
+        y = self.merge(y)
+        return self.psa(y)
+
+
+class DecoupledHead(nn.Module):
+    def __init__(self, c_in: int = 32, num_classes: int = 1, use_dfl: bool = False, bins: int = 8) -> None:
+        super().__init__()
+        self.use_dfl = use_dfl
+        self.bins = bins
+
+        def make_set():
+            stem = ConvBNAct(c_in, c_in, k=3, s=1)
+            reg = nn.Sequential(
+                ConvBNAct(c_in, c_in, k=3, s=1),
+                nn.Conv2d(c_in, (4 if not use_dfl else 4 * bins), 1),
+            )
+            obj = nn.Sequential(ConvBNAct(c_in, c_in, k=3, s=1), nn.Conv2d(c_in, 1, 1))
+            cls = nn.Sequential(ConvBNAct(c_in, c_in, k=3, s=1), nn.Conv2d(c_in, num_classes, 1))
+            return stem, reg, obj, cls
+
+        self.stem_m, self.reg_m, self.obj_m, self.cls_m = make_set()
+        self.stem_o, self.reg_o, self.obj_o, self.cls_o = make_set()
+
+    def forward(self, x: torch.Tensor):
+        xm = self.stem_m(x)
+        reg_m = self.reg_m(xm)
+        obj_m = self.obj_m(xm)
+        cls_m = self.cls_m(xm)
+
+        xo = self.stem_o(x)
+        reg_o = self.reg_o(xo)
+        obj_o = self.obj_o(xo)
+        cls_o = self.cls_o(xo)
+        return {"o2m": (reg_m, obj_m, cls_m), "o2o": (reg_o, obj_o, cls_o)}
+
+
+class LP_YOLO_Fuse(nn.Module):
+    def __init__(self, in_ch: int = 3, num_classes: int = 1, use_psa: bool = True, use_dfl: bool = False, bins: int = 8) -> None:
+        super().__init__()
+        self.backbone = BackboneLite(in_ch=in_ch)
+        self.neck = NeckPANLite(c_in=self.backbone.out_c, c_mid=32, use_psa=use_psa)
+        self.head = DecoupledHead(c_in=self.neck.out_c, num_classes=num_classes, use_dfl=use_dfl, bins=bins)
+        self.stride = LP_STRIDE
+
+    def forward(self, x: torch.Tensor):
+        p3 = self.backbone(x)
+        f = self.neck(p3)
+        return self.head(f)
+
+
+def dist2bbox_ltbr(ltrb: torch.Tensor, cx: torch.Tensor, cy: torch.Tensor) -> torch.Tensor:
+    l, t, r, b = ltrb[..., 0], ltrb[..., 1], ltrb[..., 2], ltrb[..., 3]
+    x1 = cx - l
+    y1 = cy - t
+    x2 = cx + r
+    y2 = cy + b
+    return torch.stack([x1, y1, x2, y2], dim=-1)
+
+
+# ==============================
+# OCR 모델 구조 (AttnOCR)
+# ==============================
+class Charset:
+    def __init__(self, charset: str) -> None:
+        self.idx2ch = ["<PAD>", "<SOS>", "<EOS>", "<UNK>"] + list(charset)
+        self.ch2idx = {ch: i for i, ch in enumerate(self.idx2ch)}
+        self.pad, self.sos, self.eos, self.unk = 0, 1, 2, 3
+
+    def encode(self, text: str, max_len: int) -> torch.Tensor:
+        ids = [self.sos]
+        ids.extend(self.ch2idx.get(ch, self.unk) for ch in text[: max_len - 2])
+        ids.append(self.eos)
+        if len(ids) < max_len:
+            ids.extend([self.pad] * (max_len - len(ids)))
+        return torch.tensor(ids, dtype=torch.long)
+
+    def decode(self, ids: List[int]) -> str:
+        result = []
+        for idx in ids:
+            ch = self.idx2ch[idx]
+            if ch == "<EOS>":
+                break
+            if ch not in {"<PAD>", "<SOS>", "<EOS>", "<UNK>"}:
+                result.append(ch)
+        return "".join(result)
+
+
+class CNNEncoder(nn.Module):
+    def __init__(self, in_ch: int = 1, out_ch: int = 256) -> None:
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Conv2d(in_ch, 64, 3, 1, 1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(64, 128, 3, 1, 1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(True),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(128, out_ch, 3, 1, 1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(True),
+        )
+        self.out_ch = out_ch
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        f = self.body(x)
+        n, c, h, w = f.shape
+        f = F.adaptive_avg_pool2d(f, (1, w)).squeeze(2)
+        f = f.permute(2, 0, 1)
+        return f
+
+
+class SeqEncoder(nn.Module):
+    def __init__(self, in_dim: int, hid: int = 256, num_layers: int = 2, bidir: bool = True) -> None:
+        super().__init__()
+        self.rnn = nn.LSTM(in_dim, hid, num_layers=num_layers, bidirectional=bidir)
+        self.out_dim = hid * (2 if bidir else 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out, _ = self.rnn(x)
+        return out
+
+
+class AdditiveAttention(nn.Module):
+    def __init__(self, enc_dim: int, dec_dim: int, attn_dim: int = 256) -> None:
+        super().__init__()
+        self.W_e = nn.Linear(enc_dim, attn_dim, bias=False)
+        self.W_d = nn.Linear(dec_dim, attn_dim, bias=False)
+        self.v = nn.Linear(attn_dim, 1, bias=False)
+
+    def forward(self, enc_out: torch.Tensor, dec_h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        T, N, E = enc_out.size()
+        e_proj = self.W_e(enc_out)
+        d_proj = self.W_d(dec_h).unsqueeze(0)
+        scores = self.v(torch.tanh(e_proj + d_proj)).squeeze(-1)
+        alpha = torch.softmax(scores, dim=0)
+        ctx = (alpha.unsqueeze(-1) * enc_out).sum(0)
+        return ctx, alpha
+
+
+class AttnDecoder(nn.Module):
+    def __init__(self, vocab_size: int, enc_dim: int = 256, dec_dim: int = 256, emb_dim: int = 128) -> None:
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, emb_dim, padding_idx=0)
+        self.rnn = nn.LSTMCell(emb_dim + enc_dim, dec_dim)
+        self.attn = AdditiveAttention(enc_dim, dec_dim)
+        self.fc = nn.Linear(dec_dim + enc_dim, vocab_size)
+
+    def forward(
+        self,
+        enc_out: torch.Tensor,
+        tgt: Optional[torch.Tensor] = None,
+        max_len: int = 16,
+        teacher_forcing: float = 0.5,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        T, N, _ = enc_out.size()
+        device = enc_out.device
+        h = torch.zeros(N, self.rnn.hidden_size, device=device)
+        c = torch.zeros_like(h)
+        y = torch.full((N,), fill_value=1, dtype=torch.long, device=device)
+        logits: List[torch.Tensor] = []
+        atts: List[torch.Tensor] = []
+        for t in range(max_len):
+            emb = self.embedding(y)
+            ctx, alpha = self.attn(enc_out, h)
+            rnn_in = torch.cat([emb, ctx], dim=-1)
+            h, c = self.rnn(rnn_in, (h, c))
+            out = torch.cat([h, ctx], dim=-1)
+            logit = self.fc(out)
+            logits.append(logit)
+            atts.append(alpha.permute(1, 0))
+            if tgt is not None and torch.rand(1).item() < teacher_forcing:
+                y = tgt[:, t]
+            else:
+                y = logit.argmax(dim=-1)
+        logits_tensor = torch.stack(logits, dim=1)
+        atts_tensor = torch.stack(atts, dim=1)
+        return logits_tensor, atts_tensor
+
+
+class AttnOCR(nn.Module):
+    def __init__(self, vocab_size: int, img_ch: int = 1, cnn_dim: int = 256, use_bilstm: bool = True) -> None:
+        super().__init__()
+        self.cnn = CNNEncoder(in_ch=img_ch, out_ch=cnn_dim)
+        if use_bilstm:
+            self.seq = SeqEncoder(cnn_dim, hid=256, bidir=True)
+            enc_dim = self.seq.out_dim
+        else:
+            self.seq = nn.Identity()
+            enc_dim = cnn_dim
+        self.dec = AttnDecoder(vocab_size=vocab_size, enc_dim=enc_dim, dec_dim=256, emb_dim=128)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        tgt_ids: Optional[torch.Tensor] = None,
+        max_len: int = 16,
+        teacher_forcing: float = 0.5,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        enc = self.cnn(x)
+        enc = self.seq(enc)
+        return self.dec(enc, tgt=tgt_ids, max_len=max_len, teacher_forcing=teacher_forcing)
 
 
 # ==============================
@@ -128,24 +417,16 @@ def _extract_meta(ckpt: dict) -> dict:
 
 
 def _load_plate_detector(weight_path: Path, device: torch.device) -> torch.nn.Module:
-    model_mod, utils_mod = _get_detection_modules()
-    model_cls = getattr(model_mod, "LP_YOLO_Fuse")
-    model = model_cls().to(device)
+    model = LP_YOLO_Fuse().to(device)
     ckpt = torch.load(weight_path, map_location=device)
     state_dict = _extract_state_dict(ckpt)
     model.load_state_dict(state_dict, strict=True)
     model.eval()
-    if not hasattr(model, "stride"):
-        model.stride = LP_STRIDE
-    model.dist2bbox = getattr(utils_mod, "dist2bbox_ltbr")
+    model.dist2bbox = dist2bbox_ltbr
     return model
 
 
 def _load_ocr_bundle(weight_path: Path, device: torch.device) -> OCRBundle:
-    ocr_mod = _get_ocr_module()
-    Charset = getattr(ocr_mod, "Charset")
-    AttnOCR = getattr(ocr_mod, "AttnOCR")
-
     ckpt = torch.load(weight_path, map_location=device)
     meta = _extract_meta(ckpt)
 
@@ -245,11 +526,7 @@ def _run_plate_detection(
         idx = torch.arange(bins, device=reg_logits.device, dtype=reg_logits.dtype)
         reg = (prob * idx).sum(-1)
 
-    dist2bbox = getattr(model, "dist2bbox", None)
-    if dist2bbox is None:
-        _, utils_mod = _get_detection_modules()
-        dist2bbox = getattr(utils_mod, "dist2bbox_ltbr")
-    boxes = dist2bbox(reg, cx.view(-1), cy.view(-1)).view(B, -1, 4)
+    boxes = dist2bbox_ltbr(reg, cx.view(-1), cy.view(-1)).view(B, -1, 4)
     scores = torch.sigmoid(obj_o).view(B, -1) * torch.sigmoid(cls_o).view(B, -1)
 
     boxes = boxes[0]
