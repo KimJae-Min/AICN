@@ -73,7 +73,7 @@ def super_res_x2(img_gray):
     """
     return cv2.resize(
         img_gray,
-        (img_gray.shape[1] * 2, img_gray.shape[0] * 2),
+        (img_gray.shape[1] * 5, img_gray.shape[0] * 5),
         interpolation=cv2.INTER_CUBIC
     )
 
