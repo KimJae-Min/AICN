@@ -6,9 +6,7 @@ from datetime import datetime
 import streamlit as st
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as ExcelImage
-import cv2
-import numpy as np
-from PIL import Image, ExifTags, UnidentifiedImageError
+from PIL import Image, ExifTags
 
 from my_models import load_models, detect_car_plate
 
@@ -27,15 +25,12 @@ def save_uploaded_file(directory, uploaded_file):
         f.write(uploaded_file.getbuffer())
     return path
 
-
 def extract_zip(zip_path):
     extract_to = f"extracted/{uuid.uuid4().hex}"
     os.makedirs(extract_to, exist_ok=True)
     files = []
-
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
         zip_ref.extractall(extract_to)
-
     for root, _, filenames in os.walk(extract_to):
         for fn in filenames:
             full_path = os.path.join(root, fn)
@@ -46,7 +41,6 @@ def extract_zip(zip_path):
             elif full_path.lower().endswith('.zip'):
                 files += extract_zip(full_path)
     return files
-
 
 def get_image_date(path):
     try:
@@ -61,16 +55,13 @@ def get_image_date(path):
         pass
     return datetime.fromtimestamp(os.path.getmtime(path))
 
-
 def save_to_excel(infos, filename):
     if not infos:
         st.warning("⚠️ 내보낼 데이터가 없습니다.")
         return
-
     os.makedirs('excel_outputs', exist_ok=True)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     out_path = f"excel_outputs/{filename}_{timestamp}.xlsx"
-
     wb = Workbook()
     ws = wb.active
     ws.title = "차량 인식 결과"
@@ -93,10 +84,8 @@ def save_to_excel(infos, filename):
                 ws.row_dimensions[idx].height = img.height * 0.75
         except:
             continue
-
     wb.save(out_path)
     st.success(f"📊 엑셀 저장 완료: `{out_path}`")
-
 
 # ==============================
 # Streamlit 모델 로드
@@ -105,21 +94,32 @@ def save_to_excel(infos, filename):
 def load_models_cached():
     return load_models()
 
-
 # ==============================
 # Main
 # ==============================
 def main():
     plate_detector, ocr_bundle = load_models_cached()
 
+    # 세션 상태 초기화
     if 'file_info' not in st.session_state:
         st.session_state['file_info'] = []
     if 'processed_files' not in st.session_state:
         st.session_state['processed_files'] = set()
     if 'current_page' not in st.session_state:
         st.session_state['current_page'] = 1
+    if 'upload_key' not in st.session_state:
+        st.session_state['upload_key'] = str(uuid.uuid4())
 
     st.title("🚗 차량 번호판 자동 인식 시스템")
+
+    # 사이드바: 업로드 초기화 버튼
+    if st.sidebar.button("🗑 업로드 초기화"):
+        st.session_state['file_info'] = []
+        st.session_state['processed_files'] = set()
+        st.session_state['current_page'] = 1
+        st.session_state['upload_key'] = str(uuid.uuid4())
+        st.success("📂 업로드된 사진과 데이터가 초기화되었습니다.")
+
     menu = ['📂 파일 업로드', '🔧 번호판 수정 및 결과 확인', 'ℹ️ About']
     choice = st.sidebar.radio('메뉴 선택', menu)
 
@@ -128,8 +128,6 @@ def main():
     # ==============================
     if choice == '📂 파일 업로드':
         col_upload, col_list = st.columns([1, 2])
-
-        # 좌측 업로드
         with col_upload:
             st.markdown("### 📁 이미지 / ZIP 파일 업로드")
             st.markdown("- 이미지(.png, .jpg, .jpeg) 또는 ZIP(.zip)")
@@ -138,21 +136,31 @@ def main():
                 "파일 선택 👇",
                 type=['png', 'jpg', 'jpeg', 'zip'],
                 accept_multiple_files=True,
-                label_visibility="collapsed"
+                label_visibility="collapsed",
+                key=st.session_state['upload_key']
             )
 
             log_box = st.empty()
             progress_bar = st.progress(0)
             infos = []
+            skipped_files = []
 
             if uploaded:
-                for idx, f in enumerate(uploaded, start=1):
-                    progress_bar.progress(idx / len(uploaded))
-                    log_box.info(f"📄 {f.name} 처리 중...")
+                # 업로드 제한: 최대 50개
+                remaining = 50 - len(st.session_state['file_info'])
+                files_to_add = []
+                for f in uploaded:
+                    if f.name not in st.session_state['processed_files'] and remaining > 0:
+                        files_to_add.append(f)
+                    elif f.name not in st.session_state['processed_files']:
+                        skipped_files.append(f.name)
 
-                    if f.name in st.session_state['processed_files']:
-                        log_box.warning(f"⚠️ 이미 처리된 파일: {f.name} → 건너뜀")
-                        continue
+                if skipped_files:
+                    st.warning(f"⚠️ 최대 50개 제한: 다음 파일은 처리되지 않음 → {', '.join(skipped_files)}")
+
+                for idx, f in enumerate(files_to_add, start=1):
+                    progress_bar.progress(idx / len(files_to_add))
+                    log_box.info(f"📄 {f.name} 처리 중...")
 
                     saved_path = save_uploaded_file('uploads', f)
                     files_to_process = [saved_path]
@@ -164,7 +172,13 @@ def main():
                         if file_key in st.session_state['processed_files']:
                             log_box.warning(f"⚠️ 이미 처리된 파일: {file_key} → 건너뜀")
                             continue
+
+                        if remaining <= 0:
+                            skipped_files.append(file_key)
+                            continue
+
                         st.session_state['processed_files'].add(file_key)
+                        remaining -= 1
 
                         plates, plate_imgs = detect_car_plate(fp, plate_detector, ocr_bundle)
                         infos.append({
@@ -175,16 +189,17 @@ def main():
                             'plate_imgs': plate_imgs
                         })
 
+                if skipped_files:
+                    st.warning(f"⚠️ 처리되지 않은 파일: {', '.join(skipped_files)}")
+
                 if infos:
                     st.session_state['file_info'] += infos
                     st.session_state['file_info'].sort(
                         key=lambda x: datetime.strptime(x['capture_time'], '%Y-%m-%d %H:%M:%S')
                     )
-
                 progress_bar.progress(1.0)
                 log_box.success("✅ 업로드 및 인식 완료!")
 
-        # 우측 차량 목록
         with col_list:
             if st.session_state['file_info']:
                 st.markdown("### 📸 인식된 차량 목록")
@@ -202,16 +217,12 @@ def main():
         file_info = st.session_state['file_info']
         per_page = 10
         total_pages = (len(file_info) + per_page - 1) // per_page
-
         current_page = st.session_state['current_page']
         start_idx = (current_page - 1) * per_page
         end_idx = start_idx + per_page
         current_items = file_info[start_idx:end_idx]
 
-        # 좌우 분할
         left_col, right_col = st.columns([1, 2])
-
-        # 좌측: 차량 선택 라디오
         with left_col:
             st.markdown("### 차량 목록")
             selected_plate_key = st.radio(
@@ -222,22 +233,18 @@ def main():
             selected_idx = int(selected_plate_key.split('.')[0]) - 1
             info = file_info[selected_idx]
 
-        # 우측: 원본 이미지 + 첫 번째 번호판 크롭
         with right_col:
             st.markdown("### 선택한 차량 상세보기")
             orig_img = info['path']
             plate_imgs = info['plate_imgs']
 
             img_cols = st.columns(2)
-            # 원본 이미지
             with img_cols[0]:
                 st.image(orig_img, caption="📷 원본 이미지", use_container_width=True)
-            # 첫 번째 번호판 크롭
             if plate_imgs:
                 with img_cols[1]:
                     st.image(plate_imgs[0], caption="🔍 번호판 크롭 1", use_container_width=True)
 
-            # 번호판 수정
             def update_plate(path):
                 for item in st.session_state['file_info']:
                     if item['path'] == path:
@@ -251,23 +258,18 @@ def main():
                 args=(info['path'],)
             )
 
-        # 페이지네이션
+        # 페이지네이션 버튼
         st.markdown("---")
         st.markdown("#### 📄 페이지 선택")
         col_prev, col_page, col_next = st.columns([1, 2, 1])
-
         with col_prev:
-            if st.button("◀ 이전") and current_page > 1:
-                st.session_state['current_page'] -= 1
-                st.rerun()
-
+            if st.button("◀ 이전"):
+                st.session_state['current_page'] = max(1, st.session_state['current_page'] - 1)
         with col_page:
             st.markdown(f"### {current_page} / {total_pages}", unsafe_allow_html=True)
-
         with col_next:
-            if st.button("다음 ▶") and current_page < total_pages:
-                st.session_state['current_page'] += 1
-                st.rerun()
+            if st.button("다음 ▶"):
+                st.session_state['current_page'] = min(total_pages, st.session_state['current_page'] + 1)
 
         # 엑셀 내보내기
         st.markdown("---")
