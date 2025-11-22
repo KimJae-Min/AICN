@@ -360,15 +360,10 @@ def should_augment(lbl: str) -> bool:
         return False
     return True
 
-# ── 파일 읽기/전처리 헬퍼───────────────
 def imread_unicode(path, flag=cv2.IMREAD_GRAYSCALE):
     data = np.fromfile(path, dtype=np.uint8)
     return cv2.imdecode(data, flag)
 
-# enhance_plate는 기존 프로젝트 함수 사용
-# from your_module import enhance_plate
-
-# ── 증강 프리미티브 ──────────────────────────────────────────────────────────
 def down_up(img, s_min=0.5, s_max=0.85):
     h, w = img.shape[:2]
     s = random.uniform(s_min, s_max)
